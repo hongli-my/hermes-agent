@@ -103,6 +103,15 @@ def build_turn_context(
     except Exception:
         pass
 
+    # Sync per-agent working_dir into TERMINAL_CWD so terminal/code_execution
+    # tools land in the right worktree.  Re-asserted here every turn so that
+    # concurrent agents (e.g. workflow iteration with max_concurrent) each
+    # restore their own worktree before dispatching tools.
+    try:
+        agent._apply_working_dir()
+    except Exception:
+        pass
+
     # Tag log records on this thread with the session ID for ``hermes logs``.
     set_session_context(agent.session_id)
 

@@ -321,6 +321,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_call_id=getattr(tool_call, "id", "") or "",
         )
 
+        # Checkpoint before destructive terminal commands
+        if function_name == "terminal" and agent._checkpoint_mgr.enabled:
+            try:
+                cmd = function_args.get("command", "")
+                if _is_destructive_command(cmd):
+                    cwd = function_args.get("workdir") or getattr(agent, "working_dir", None) or os.getenv("TERMINAL_CWD", os.getcwd())
+                    agent._checkpoint_mgr.ensure_checkpoint(
+                        cwd, f"before terminal: {cmd[:60]}"
+                    )
+            except Exception:
+                pass
+
         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
         # We must know whether the tool will execute before touching
         # checkpoint state (dedup slot, real snapshots).
@@ -919,7 +931,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 cmd = function_args.get("command", "")
                 if _is_destructive_command(cmd):
-                    cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                    cwd = function_args.get("workdir") or getattr(agent, "working_dir", None) or os.getenv("TERMINAL_CWD", os.getcwd())
                     agent._checkpoint_mgr.ensure_checkpoint(
                         cwd, f"before terminal: {cmd[:60]}"
                     )

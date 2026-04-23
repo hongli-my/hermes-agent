@@ -4145,6 +4145,45 @@ def cmd_cron(args):
     cron_command(args)
 
 
+def cmd_workflow(args):
+    """Workflow management and execution."""
+    from workflow.cli import handle_workflow_command
+    # Build argv-style args for the workflow CLI dispatcher
+    wf_args = []
+    wf_cmd = getattr(args, 'workflow_command', None)
+    if wf_cmd:
+        wf_args.append(wf_cmd)
+
+    wf_id = getattr(args, 'workflow_id', None)
+    wf_file = getattr(args, 'workflow_file', None)
+    wf_inputs_json = getattr(args, 'inputs', None)
+    wf_input_args = getattr(args, 'input_args', None)
+
+    if wf_id:
+        wf_args.append(wf_id)
+    if wf_file:
+        wf_args.append(wf_file)
+
+    # --inputs: JSON string → forward as key=val pairs for workflow/cli.py _parse_inputs
+    if wf_inputs_json:
+        try:
+            import json as _json
+            parsed = _json.loads(wf_inputs_json)
+            if isinstance(parsed, dict):
+                for k, v in parsed.items():
+                    wf_args.append(f"{k}={_json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v}")
+            else:
+                wf_args.extend(["--inputs", wf_inputs_json])
+        except Exception:
+            wf_args.extend(["--inputs", wf_inputs_json])
+
+    # key=val style input args (from run / run-file nargs='*')
+    if wf_input_args:
+        wf_args.extend(wf_input_args)
+
+    handle_workflow_command(wf_args)
+
+
 def cmd_webhook(args):
     """Webhook subscription management."""
     from hermes_cli.webhook import webhook_command
@@ -11805,6 +11844,52 @@ def main():
     # status command  (parser built in hermes_cli/subcommands/status.py)
     # =========================================================================
     build_status_parser(subparsers, cmd_status=cmd_status)
+
+    # workflow command
+    # =========================================================================
+    workflow_parser = subparsers.add_parser(
+        "workflow",
+        help="Workflow management and execution",
+        description="Manage and run DAG-based workflows with script, agent, and iterate nodes",
+    )
+    workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_command")
+
+    # workflow list
+    workflow_subparsers.add_parser("list", help="List all workflows")
+
+    # workflow show
+    wf_show = workflow_subparsers.add_parser("show", help="Show workflow definition")
+    wf_show.add_argument("workflow_id", help="Workflow ID to show")
+
+    # workflow create
+    wf_create = workflow_subparsers.add_parser("create", help="Create workflow from YAML file")
+    wf_create.add_argument("workflow_file", help="Path to workflow YAML file")
+
+    # workflow delete
+    wf_delete = workflow_subparsers.add_parser("delete", help="Delete a workflow")
+    wf_delete.add_argument("workflow_id", help="Workflow ID to delete")
+
+    # workflow run
+    wf_run = workflow_subparsers.add_parser("run", help="Execute a registered workflow")
+    wf_run.add_argument("workflow_id", help="Workflow ID to run")
+    wf_run.add_argument("--inputs", help="JSON string of input variables (e.g. '{\"date\":\"2026-04-25\"}')")
+    wf_run.add_argument("input_args", nargs="*", help="Input variables as key=val pairs (e.g. date=2026-04-25)")
+
+    # workflow runs
+    wf_runs = workflow_subparsers.add_parser("runs", help="List runs for a workflow")
+    wf_runs.add_argument("workflow_id", help="Workflow ID")
+
+    # workflow run-file
+    wf_run_file = workflow_subparsers.add_parser("run-file", help="Execute a YAML workflow file directly (no registration needed)")
+    wf_run_file.add_argument("workflow_file", help="Path to YAML workflow file")
+    wf_run_file.add_argument("--inputs", help="JSON string of input variables (e.g. '{\"date\":\"2026-04-25\"}')")
+    wf_run_file.add_argument("input_args", nargs="*", help="Input variables as key=val pairs (e.g. date=2026-04-25)")
+
+    # workflow validate
+    wf_validate = workflow_subparsers.add_parser("validate", help="Validate a YAML workflow file")
+    wf_validate.add_argument("workflow_file", help="Path to YAML workflow file")
+
+    workflow_parser.set_defaults(func=cmd_workflow)
 
     # =========================================================================
     # cron command  (parser built in hermes_cli/subcommands/cron.py)

@@ -3144,6 +3144,57 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return None
 
+    # ------------------------------------------------------------------
+    # Workflow API
+    # ------------------------------------------------------------------
+
+    _WORKFLOW_AVAILABLE = False
+    try:
+        from workflow import (
+            list_workflows as _wf_list,
+            get_workflow as _wf_get,
+            create_workflow as _wf_create,
+            delete_workflow as _wf_delete,
+            list_workflow_runs as _wf_list_runs,
+            get_workflow_run as _wf_get_run,
+            run_workflow as _wf_run,
+        )
+        from workflow.schema import (
+            parse_yaml_workflow as _wf_parse_yaml,
+            validate_workflow as _wf_validate,
+        )
+        _wf_list = staticmethod(_wf_list)
+        _wf_get = staticmethod(_wf_get)
+        _wf_create = staticmethod(_wf_create)
+        _wf_delete = staticmethod(_wf_delete)
+        _wf_list_runs = staticmethod(_wf_list_runs)
+        _wf_get_run = staticmethod(_wf_get_run)
+        _wf_run = staticmethod(_wf_run)
+        _wf_parse_yaml = staticmethod(_wf_parse_yaml)
+        _wf_validate = staticmethod(_wf_validate)
+        _WORKFLOW_AVAILABLE = True
+    except ImportError:
+        pass
+
+    _WF_ID_RE = __import__("re").compile(r"[a-f0-9\-]{8,36}")
+
+    def _check_workflow_available(self) -> Optional["web.Response"]:
+        """Return error response if workflow module isn't available."""
+        if not self._WORKFLOW_AVAILABLE:
+            return web.json_response(
+                {"error": "Workflow module not available"}, status=501,
+            )
+        return None
+
+    def _check_workflow_id(self, request: "web.Request") -> tuple:
+        """Validate and extract workflow_id. Returns (workflow_id, error_response)."""
+        workflow_id = request.match_info.get("workflow_id", "")
+        if not workflow_id or not self._WF_ID_RE.match(workflow_id):
+            return workflow_id, web.json_response(
+                {"error": "Invalid workflow ID"}, status=400,
+            )
+        return workflow_id, None
+
     def _check_job_id(self, request: "web.Request") -> tuple:
         """Validate and extract job_id. Returns (job_id, error_response)."""
         job_id = request.match_info["job_id"]
@@ -3420,6 +3471,193 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
 
+
+    # ------------------------------------------------------------------
+    # Workflow management API
+    # ------------------------------------------------------------------
+
+    async def _handle_list_workflows(self, request: "web.Request") -> "web.Response":
+        """GET /api/workflows — list all registered workflows."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        wf_err = self._check_workflow_available()
+        if wf_err:
+            return wf_err
+        try:
+            workflows = self._wf_list()
+            return web.json_response({"workflows": workflows})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_workflow(self, request: "web.Request") -> "web.Response":
+        """GET /api/workflows/{workflow_id} — get a workflow definition."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        wf_err = self._check_workflow_available()
+        if wf_err:
+            return wf_err
+        workflow_id, id_err = self._check_workflow_id(request)
+        if id_err:
+            return id_err
+        try:
+            wf = self._wf_get(workflow_id)
+            if not wf:
+                return web.json_response({"error": "Workflow not found"}, status=404)
+            return web.json_response({"workflow": wf})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_create_workflow(self, request: "web.Request") -> "web.Response":
+        """POST /api/workflows — register a workflow from YAML text."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        wf_err = self._check_workflow_available()
+        if wf_err:
+            return wf_err
+        try:
+            body = await request.json()
+            yaml_text = body.get("yaml_text", "")
+            if not yaml_text.strip():
+                return web.json_response({"error": "yaml_text is required"}, status=400)
+            parsed = self._wf_parse_yaml(yaml_text)
+            wf = self._wf_create(parsed)
+            return web.json_response({"workflow": wf}, status=201)
+        except Exception as e:
+            logger.exception("POST /api/workflows failed")
+            return web.json_response({"error": str(e)}, status=400)
+
+    async def _handle_delete_workflow(self, request: "web.Request") -> "web.Response":
+        """DELETE /api/workflows/{workflow_id} — delete a workflow."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        wf_err = self._check_workflow_available()
+        if wf_err:
+            return wf_err
+        workflow_id, id_err = self._check_workflow_id(request)
+        if id_err:
+            return id_err
+        try:
+            ok = self._wf_delete(workflow_id)
+            if not ok:
+                return web.json_response({"error": "Workflow not found"}, status=404)
+            return web.json_response({"ok": True})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_list_workflow_runs(self, request: "web.Request") -> "web.Response":
+        """GET /api/workflows/{workflow_id}/runs — list all runs for a workflow."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        wf_err = self._check_workflow_available()
+        if wf_err:
+            return wf_err
+        workflow_id, id_err = self._check_workflow_id(request)
+        if id_err:
+            return id_err
+        try:
+            runs = self._wf_list_runs(workflow_id)
+            return web.json_response({"runs": runs})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_workflow_run(self, request: "web.Request") -> "web.Response":
+        """GET /api/workflows/{workflow_id}/runs/{run_id} — get a specific run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        wf_err = self._check_workflow_available()
+        if wf_err:
+            return wf_err
+        workflow_id, id_err = self._check_workflow_id(request)
+        if id_err:
+            return id_err
+        run_id = request.match_info.get("run_id", "")
+        if not run_id:
+            return web.json_response({"error": "Missing run_id"}, status=400)
+        try:
+            run = self._wf_get_run(workflow_id, run_id)
+            if not run:
+                return web.json_response({"error": "Run not found"}, status=404)
+            return web.json_response({"run": run})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_run_workflow(self, request: "web.Request") -> "web.Response":
+        """POST /api/workflows/{workflow_id}/run — execute a registered workflow."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        wf_err = self._check_workflow_available()
+        if wf_err:
+            return wf_err
+        workflow_id, id_err = self._check_workflow_id(request)
+        if id_err:
+            return id_err
+        try:
+            wf = self._wf_get(workflow_id)
+            if not wf:
+                return web.json_response({"error": "Workflow not found"}, status=404)
+            body = await request.json() if request.body else {}
+            inputs = body.get("inputs", {}) if isinstance(body, dict) else {}
+            # run_workflow is synchronous — run in executor to avoid blocking
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self._wf_run, wf, inputs)
+            return web.json_response({"result": result})
+        except Exception as e:
+            logger.exception("POST /api/workflows/{id}/run failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_run_workflow_file(self, request: "web.Request") -> "web.Response":
+        """POST /api/workflows/run-file — execute a workflow from YAML text."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        wf_err = self._check_workflow_available()
+        if wf_err:
+            return wf_err
+        try:
+            body = await request.json()
+            yaml_text = body.get("yaml_text", "")
+            if not yaml_text.strip():
+                return web.json_response({"error": "yaml_text is required"}, status=400)
+            inputs = body.get("inputs", {})
+            parsed = self._wf_parse_yaml(yaml_text)
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, self._wf_run, parsed, inputs)
+            return web.json_response({"result": result})
+        except Exception as e:
+            logger.exception("POST /api/workflows/run-file failed")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_validate_workflow(self, request: "web.Request") -> "web.Response":
+        """POST /api/workflows/validate — validate a workflow YAML."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        wf_err = self._check_workflow_available()
+        if wf_err:
+            return wf_err
+        try:
+            body = await request.json()
+            yaml_text = body.get("yaml_text", "")
+            if not yaml_text.strip():
+                return web.json_response({"valid": False, "error": "yaml_text is required"})
+            parsed = self._wf_parse_yaml(yaml_text)
+            errors = self._wf_validate(parsed)
+            if errors:
+                return web.json_response({"valid": False, "errors": errors})
+            return web.json_response({
+                "valid": True,
+                "name": parsed.get("name", "unknown"),
+                "steps": len(parsed.get("nodes", {})),
+            })
+        except Exception as e:
+            return web.json_response({"valid": False, "error": str(e)})
 
     # ------------------------------------------------------------------
     # Output extraction helper
@@ -4280,6 +4518,17 @@ class APIServerAdapter(BasePlatformAdapter):
             # NAS-minted JWT (NOT API_SERVER_KEY), so it has its own auth path.
             if _CRON_AVAILABLE:
                 self._app.router.add_post("/api/cron/fire", self._handle_cron_fire)
+
+            # Workflow management API
+            self._app.router.add_get("/api/workflows", self._handle_list_workflows)
+            self._app.router.add_post("/api/workflows", self._handle_create_workflow)
+            self._app.router.add_post("/api/workflows/validate", self._handle_validate_workflow)
+            self._app.router.add_post("/api/workflows/run-file", self._handle_run_workflow_file)
+            self._app.router.add_get("/api/workflows/{workflow_id}", self._handle_get_workflow)
+            self._app.router.add_delete("/api/workflows/{workflow_id}", self._handle_delete_workflow)
+            self._app.router.add_get("/api/workflows/{workflow_id}/runs", self._handle_list_workflow_runs)
+            self._app.router.add_get("/api/workflows/{workflow_id}/runs/{run_id}", self._handle_get_workflow_run)
+            self._app.router.add_post("/api/workflows/{workflow_id}/run", self._handle_run_workflow)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)

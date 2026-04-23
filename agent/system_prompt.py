@@ -24,6 +24,7 @@ Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
@@ -408,10 +409,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         context_parts.append(system_message)
 
     if not agent.skip_context_files:
-        # Prefer the configured TERMINAL_CWD (gateway mode). When unset (local
-        # CLI), None lets build_context_files_prompt fall back to the launch
-        # dir — the user's real cwd there, but the install dir for the gateway
-        # daemon, which is why the gateway sets TERMINAL_CWD.
+        # Use TERMINAL_CWD for context file discovery when set (gateway
+        # mode).  The gateway process runs from the hermes-agent install
+        # dir, so os.getcwd() would pick up the repo's AGENTS.md and
+        # other dev files — inflating token usage by ~10k for no benefit.
+        # Per-agent ``agent.working_dir`` takes precedence so workflow
+        # agents with a workdir pin discover context files in their own
+        # worktree rather than whatever TERMINAL_CWD the shared process
+        # env happens to point at.
+        try:
+            from agent.workdir_ctx import get_terminal_cwd as _get_ctx_cwd
+            _context_cwd = getattr(agent, "working_dir", None) or _get_ctx_cwd()
+        except Exception:
+            _context_cwd = getattr(agent, "working_dir", None) or os.getenv("TERMINAL_CWD") or None
+
         context_files_prompt = _r.build_context_files_prompt(
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len)
