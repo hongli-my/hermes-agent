@@ -960,17 +960,19 @@ def _get_env_config() -> Dict[str, Any]:
     else:
         default_cwd = "/root"
 
-    # Read TERMINAL_CWD but sanity-check it for container backends.
-    # If Docker cwd passthrough is explicitly enabled, remap the host path to
-    # /workspace and track the original host path separately. Otherwise keep the
-    # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
-    if cwd:
-        cwd = os.path.expanduser(cwd)
+    # Prefer the per-agent ContextVar over the process-global env so that
+    # concurrent AIAgent instances (workflow iteration / parallel branches)
+    # each see their own worktree.  Falls back to TERMINAL_CWD env when the
+    # ContextVar is unset (CLI mode / external callers).
+    from agent.workdir_ctx import get_terminal_cwd
+    ctx_cwd = get_terminal_cwd()
+    cwd = ctx_cwd or default_cwd
+    logger.info("terminal: env_type=%s, ctx_cwd=%s, default_cwd=%s, resolved cwd=%s",
+                 env_type, ctx_cwd or "<unset>", default_cwd, cwd)
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
+        docker_cwd_source = ctx_cwd or os.getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in host_prefixes)
@@ -1699,6 +1701,17 @@ def terminal_tool(
                 _last_activity[effective_task_id] = time.time()
                 env = _active_environments[effective_task_id]
                 needs_creation = False
+                # Sync env.cwd with current per-agent workdir so that
+                # workflow engine workdir changes take effect even when
+                # the environment is reused across iteration items.
+                # Reads from the per-agent ContextVar first, falling back
+                # to TERMINAL_CWD env when unset (CLI / external callers).
+                from agent.workdir_ctx import get_terminal_cwd
+                terminal_cwd = get_terminal_cwd()
+                if terminal_cwd and os.path.isdir(terminal_cwd):
+                    logger.info("terminal: syncing env.cwd to workdir=%s (task %s, was cwd=%s)",
+                                 terminal_cwd, effective_task_id[:8], env.cwd)
+                    env.cwd = terminal_cwd
             else:
                 needs_creation = True
 
@@ -1829,6 +1842,14 @@ def terminal_tool(
                     "error": workdir_error,
                     "status": "blocked"
                 }, ensure_ascii=False)
+
+            # Auto-create workdir if it doesn't exist
+            if not os.path.exists(workdir):
+                try:
+                    os.makedirs(workdir, exist_ok=True)
+                    logger.debug("Auto-created workdir: %s", workdir)
+                except Exception as e:
+                    logger.warning("Failed to create workdir %s: %s", workdir, e)
 
         # Prepare command for execution
         pty_disabled_reason = None

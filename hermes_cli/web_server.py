@@ -3166,10 +3166,169 @@ async def update_config_raw(body: RawConfigUpdate):
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
 
 
-# ---------------------------------------------------------------------------
-# Token / cost analytics endpoint
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Workflow management endpoints
+# -------------------------------------------------------------------------
 
+class WorkflowCreate(BaseModel):
+    yaml_text: str
+
+
+class WorkflowRun(BaseModel):
+    inputs: Dict[str, Any] = {}
+
+
+class WorkflowRunFile(BaseModel):
+    yaml_text: str
+    inputs: Dict[str, Any] = {}
+
+
+@app.get("/api/workflows")
+async def list_workflows():
+    """List all registered workflows."""
+    from workflow import list_workflows
+    return list_workflows()
+
+
+@app.get("/api/workflows/{workflow_id}")
+async def get_workflow_endpoint(workflow_id: str):
+    """Get a workflow definition."""
+    from workflow import get_workflow
+    wf = get_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return wf
+
+
+@app.post("/api/workflows")
+async def create_workflow_endpoint(body: WorkflowCreate):
+    """Register a workflow from YAML text."""
+    try:
+        import yaml as _yaml
+        data = _yaml.safe_load(body.yaml_text)
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="YAML must be a mapping")
+    except _yaml.YAMLError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
+
+    try:
+        from workflow.schema import parse_yaml_workflow
+        from workflow.store import create_workflow
+        parsed = parse_yaml_workflow(body.yaml_text)
+        wf = create_workflow(parsed)
+        return wf
+    except Exception as e:
+        _log.exception("POST /api/workflows failed")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/workflows/{workflow_id}")
+async def delete_workflow_endpoint(workflow_id: str):
+    """Delete a workflow."""
+    from workflow import delete_workflow
+    ok = delete_workflow(workflow_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return {"ok": True}
+
+
+@app.get("/api/workflows/{workflow_id}/runs")
+async def list_workflow_runs_endpoint(workflow_id: str):
+    """List all runs for a workflow."""
+    from workflow import list_workflow_runs
+    return list_workflow_runs(workflow_id)
+
+
+@app.get("/api/workflows/{workflow_id}/runs/{run_id}")
+async def get_workflow_run_endpoint(workflow_id: str, run_id: str):
+    """Get a specific workflow run with full output."""
+    from workflow import get_workflow_run
+    run = get_workflow_run(workflow_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return run
+
+
+@app.post("/api/workflows/{workflow_id}/run")
+async def run_workflow_endpoint(workflow_id: str, body: WorkflowRun = WorkflowRun()):
+    """Execute a registered workflow with optional inputs."""
+    from workflow import get_workflow, run_workflow as _run
+    wf = get_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    try:
+        result = _run(wf, inputs=body.inputs)
+        return result
+    except Exception as e:
+        _log.exception("POST /api/workflows/{id}/run failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/workflows/run-file")
+async def run_workflow_file_endpoint(body: WorkflowRunFile):
+    """Execute a workflow directly from YAML text."""
+    import tempfile
+    from workflow.schema import load_yaml_file
+    from workflow.engine import run_workflow as _run
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False
+        ) as f:
+            f.write(body.yaml_text)
+            tmp_path = f.name
+
+        try:
+            wf = load_yaml_file(tmp_path)
+            result = _run(wf, inputs=body.inputs)
+            return result
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+    except Exception as e:
+        _log.exception("POST /api/workflows/run-file failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/workflows/validate")
+async def validate_workflow_endpoint(body: WorkflowCreate):
+    """Validate a workflow YAML and return errors or success."""
+    import tempfile
+    from workflow.schema import load_yaml_file, validate_workflow
+
+    try:
+        import yaml as _yaml
+        data = _yaml.safe_load(body.yaml_text)
+        if not isinstance(data, dict):
+            return {"valid": False, "error": "YAML must be a mapping"}
+    except _yaml.YAMLError as e:
+        return {"valid": False, "error": f"Parse error: {e}"}
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", delete=False
+    ) as f:
+        f.write(body.yaml_text)
+        tmp_path = f.name
+
+    try:
+        wf = load_yaml_file(tmp_path)
+        errors = validate_workflow(wf)
+        if errors:
+            return {"valid": False, "errors": errors}
+        return {
+            "valid": True,
+            "name": wf.get("name", "unknown"),
+            "steps": len(wf.get("nodes", {})),
+        }
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+# -------------------------------------------------------------------------
+# Token / cost analytics endpoint
+# -------------------------------------------------------------------------
 
 @app.get("/api/analytics/usage")
 async def get_usage_analytics(days: int = 30):

@@ -407,6 +407,15 @@ def run_conversation(
     except Exception:
         pass
 
+    # Sync per-agent working_dir into TERMINAL_CWD so terminal/code_execution
+    # tools land in the right worktree.  Re-asserted here every turn so that
+    # concurrent agents (e.g. workflow iteration with max_concurrent) each
+    # restore their own worktree before dispatching tools.
+    try:
+        agent._apply_working_dir()
+    except Exception:
+        pass
+
     # Tag all log records on this thread with the session ID so
     # ``hermes logs --session <id>`` can filter a single conversation.
     from hermes_logging import set_session_context

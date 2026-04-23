@@ -502,6 +502,14 @@ class MemoryStore:
             return []
         try:
             raw = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # 文件包含非 UTF-8 字节（可能被外部工具以 GBK 等编码写入，
+            # 或文件已损坏）。回退为 utf-8 + replace，保留可读内容，
+            # 避免整个会话因为一个 memory 文件崩溃。
+            try:
+                raw = path.read_text(encoding="utf-8", errors="replace")
+            except (OSError, IOError):
+                return []
         except (OSError, IOError):
             return []
 

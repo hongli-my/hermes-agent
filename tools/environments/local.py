@@ -11,6 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
 
@@ -489,32 +491,18 @@ class LocalEnvironment(BaseEnvironment):
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
 
-        # Recover when the cwd has been deleted out from under us — usually by
-        # a previous tool call that ran ``rm -rf`` on its own working dir
-        # (issue #17558).  Popen would otherwise raise FileNotFoundError on
-        # the cwd before bash starts, wedging every subsequent call until the
-        # gateway restarts.
-        #
-        # On Windows, ``_resolve_safe_cwd`` also normalises Git Bash-style
-        # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
-        # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
-        # and spammed as a warning on every command.
-        safe_cwd = _resolve_safe_cwd(self.cwd)
-        if safe_cwd != self.cwd:
-            # MSYS → Windows translation alone shouldn't surface as a warning
-            # (it's a benign normalization, not a recovery). Only warn when
-            # the directory really doesn't exist on disk.
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
-            if safe_cwd != normalized:
-                logger.warning(
-                    "LocalEnvironment cwd %r is missing on disk; "
-                    "falling back to %r so terminal commands keep working.",
-                    self.cwd,
-                    safe_cwd,
-                )
-            self.cwd = safe_cwd
-
-        _popen_cwd = self.cwd
+        # Defensive: if self.cwd was deleted (e.g. /tmp cleaned up), fall back
+        # to a known-existing directory so subprocess.Popen doesn't raise
+        # FileNotFoundError.
+        effective_cwd = self.cwd
+        if not os.path.isdir(effective_cwd):
+            fallback = os.getcwd()
+            logger.warning(
+                "CWD %s no longer exists (possibly /tmp cleaned up), "
+                "falling back to %s for command execution",
+                effective_cwd, fallback,
+            )
+            effective_cwd = fallback
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
@@ -528,7 +516,7 @@ class LocalEnvironment(BaseEnvironment):
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             preexec_fn=None if _IS_WINDOWS else os.setsid,
-            cwd=_popen_cwd,
+            cwd=effective_cwd,
             **_popen_kwargs,
         )
         if not _IS_WINDOWS:
@@ -615,25 +603,28 @@ class LocalEnvironment(BaseEnvironment):
     def _update_cwd(self, result: dict):
         """Read CWD from temp file (local-only, no round-trip needed).
 
-        Skip the assignment when the path no longer exists as a directory —
-        ``pwd -P`` on a deleted cwd can leave a stale value in the marker
-        file, and propagating it would re-wedge the next ``Popen``.  The
-        ``_run_bash`` recovery path will resolve a safe fallback if needed.
-
-        On Windows, the value written by Git Bash's ``pwd -P`` is in
-        MSYS form (``/c/Users/x``). Translate it to native Windows form
-        before validating with ``os.path.isdir`` and before storing on
-        ``self.cwd``; otherwise the isdir check rejects every valid
-        result and ``_run_bash`` later prints a misleading "cwd is
-        missing" warning on every command.
+        If the persisted CWD no longer exists (e.g. /tmp was cleaned up),
+        fall back to the process's current working directory so subsequent
+        commands don't crash with FileNotFoundError in subprocess.Popen.
         """
         try:
             with open(self._cwd_file, encoding="utf-8") as f:
                 cwd_path = f.read().strip()
             if _IS_WINDOWS:
                 cwd_path = _msys_to_windows_path(cwd_path)
-            if cwd_path and os.path.isdir(cwd_path):
-                self.cwd = cwd_path
+            if cwd_path:
+                if os.path.isdir(cwd_path):
+                    self.cwd = cwd_path
+                else:
+                    # Persisted directory was deleted (common for /tmp paths
+                    # after system reboot or tmpwatch).  Fall back to a
+                    # directory we know exists.
+                    fallback = os.getcwd()
+                    logger.warning(
+                        "Persisted cwd %s no longer exists, falling back to %s",
+                        cwd_path, fallback,
+                    )
+                    self.cwd = fallback
         except (OSError, FileNotFoundError):
             pass
 

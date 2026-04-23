@@ -414,6 +414,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        working_dir: Optional[str] = None
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -484,6 +485,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            working_dir=working_dir,
         )
 
     def _get_session_db_for_recall(self):
@@ -3457,6 +3459,57 @@ class AIAgent:
         from agent.chat_completion_helpers import try_activate_fallback
         return try_activate_fallback(self, reason)
 
+    # ── Per-turn working-directory binding ───────────────────────────────
+
+    def _apply_working_dir(self) -> None:
+        """Bind ``self.working_dir`` to the per-agent workdir context.
+
+        We publish the value through two channels:
+
+        * ``agent.workdir_ctx`` ContextVar — true per-agent isolation.
+          ``contextvars`` is inherited by ``ThreadPoolExecutor`` workers
+          and asyncio tasks, so concurrent agents in the workflow engine
+          each see their own worktree regardless of what peers write.
+        * ``os.environ["TERMINAL_CWD"]`` — legacy fallback for subprocess
+          tools and external integrations that haven't been migrated to
+          read the ContextVar yet.  This is inherently racy between
+          threads; tools that care about correctness read through
+          ``agent.workdir_ctx.get_terminal_cwd()`` which prefers the
+          ContextVar.
+
+        When ``self.working_dir`` is None we leave both untouched so that
+        CLI single-agent usage (which may rely on ``TERMINAL_CWD`` set
+        elsewhere) keeps working.
+
+        Idempotency: if the ContextVar already holds ``self.working_dir``
+        we skip the rewrite.  This matters under workflow concurrency —
+        ``_apply_working_dir`` is invoked before every tool dispatch, and
+        without this guard we'd needlessly clobber ``os.environ`` on every
+        call (env is process-global; concurrent threads would race).
+        """
+        if not self.working_dir:
+            return
+        try:
+            from agent.workdir_ctx import (
+                get_terminal_cwd as _get_ctx_cwd,
+                set_terminal_cwd,
+            )
+            # Skip when our value is already bound in this context.  Avoids
+            # the env-var write race between concurrent agents that all keep
+            # re-asserting the same own value at every turn.
+            try:
+                if _get_ctx_cwd() == self.working_dir:
+                    return
+            except Exception:
+                pass
+            # set_terminal_cwd also syncs os.environ, so terminal/
+            # code_execution tools that haven't switched to the new
+            # helper still land in the right place during this turn.
+            set_terminal_cwd(self.working_dir)
+        except Exception as exc:
+            logger.warning("AIAgent: failed to apply working_dir=%s: %s",
+                           self.working_dir, exc)
+
     # ── Per-turn primary restoration ─────────────────────────────────────
 
     def _restore_primary_runtime(self) -> bool:
@@ -4275,6 +4328,14 @@ class AIAgent:
         independent: read-only tools may always share the parallel path, while
         file reads/writes may do so only when their target paths do not overlap.
         """
+        # Re-assert this agent's working_dir into TERMINAL_CWD just before
+        # any tool dispatch.  When multiple AIAgent instances run in parallel
+        # threads (workflow iteration/parallel), each agent owns a separate
+        # working_dir; another thread may have overwritten the env var between
+        # turns, so we restore ours here to keep terminal/code_execution
+        # tools in our worktree.
+        self._apply_working_dir()
+
         tool_calls = assistant_message.tool_calls
 
         # Allow _vprint during tool execution even with stream consumers

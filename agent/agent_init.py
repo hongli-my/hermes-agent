@@ -61,6 +61,18 @@ from utils import base_url_host_matches
 # from inside that module.)
 logger = logging.getLogger("run_agent")
 
+def _get_terminal_cwd_safe(default: Optional[str] = None) -> Optional[str]:
+    """Return the in-process terminal cwd, falling back to env / default.
+    Thin wrapper around :func:`agent.workdir_ctx.get_terminal_cwd` that is
+    safe to call before ``agent`` is importable (e.g. during partial module
+    init).  Prefers the per-agent ContextVar, then ``TERMINAL_CWD`` env,
+    then ``default``.
+    """
+    try:
+        from agent.workdir_ctx import get_terminal_cwd
+        return get_terminal_cwd(default)
+    except Exception:
+        return os.environ.get("TERMINAL_CWD") or default
 
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
@@ -203,6 +215,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    working_dir: Optional[str] = None
 ):
     """
     Initialize the AI Agent.
@@ -282,6 +295,17 @@ def init_agent(
     agent.skip_context_files = skip_context_files
     agent.load_soul_identity = load_soul_identity
     agent.pass_session_id = pass_session_id
+    # Per-agent working directory override.  When set, it takes precedence
+    # over the global TERMINAL_CWD env var for terminal/code_execution
+    # tools.  Workflow engine uses this to isolate concurrent agents that
+    # each need a different worktree without racing on os.environ.
+    if working_dir:
+        try:
+            agent.working_dir = str(Path(working_dir).expanduser().resolve())
+        except Exception:
+            agent.working_dir = str(working_dir)
+    else:
+        agent.working_dir = None
     agent._credential_pool = credential_pool
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1528,7 +1552,7 @@ def init_agent(
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
-        working_dir=os.getenv("TERMINAL_CWD") or None,
+        working_dir=agent.working_dir or _get_terminal_cwd_safe(),
     )
     agent._user_turn_count = 0
 
