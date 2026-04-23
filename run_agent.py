@@ -259,6 +259,21 @@ def _install_safe_stdio() -> None:
             setattr(sys, stream_name, _SafeWriter(stream))
 
 
+def _get_terminal_cwd_safe(default: Optional[str] = None) -> Optional[str]:
+    """Return the in-process terminal cwd, falling back to env / default.
+
+    Thin wrapper around :func:`agent.workdir_ctx.get_terminal_cwd` that is
+    safe to call before ``agent`` is importable (e.g. during partial module
+    init).  Prefers the per-agent ContextVar, then ``TERMINAL_CWD`` env,
+    then ``default``.
+    """
+    try:
+        from agent.workdir_ctx import get_terminal_cwd
+        return get_terminal_cwd(default)
+    except Exception:
+        return os.environ.get("TERMINAL_CWD") or default
+
+
 class IterationBudget:
     """Thread-safe iteration counter for an agent.
 
@@ -947,6 +962,7 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
+        working_dir: Optional[str] = None
     ):
         """
         Initialize the AI Agent.
@@ -1022,6 +1038,17 @@ class AIAgent:
         self.skip_context_files = skip_context_files
         self.load_soul_identity = load_soul_identity
         self.pass_session_id = pass_session_id
+        # Per-agent working directory override.  When set, it takes precedence
+        # over the global TERMINAL_CWD env var for terminal/code_execution
+        # tools.  Workflow engine uses this to isolate concurrent agents that
+        # each need a different worktree without racing on os.environ.
+        if working_dir:
+            try:
+                self.working_dir = str(Path(working_dir).expanduser().resolve())
+            except Exception:
+                self.working_dir = str(working_dir)
+        else:
+            self.working_dir = None
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -2046,7 +2073,7 @@ class AIAgent:
                 logger.debug("Context engine on_session_start: %s", _ce_err)
 
         self._subdirectory_hints = SubdirectoryHintTracker(
-            working_dir=os.getenv("TERMINAL_CWD") or None,
+            working_dir=self.working_dir or _get_terminal_cwd_safe(),
         )
         self._user_turn_count = 0
 
@@ -4912,7 +4939,11 @@ class AIAgent:
             # mode).  The gateway process runs from the hermes-agent install
             # dir, so os.getcwd() would pick up the repo's AGENTS.md and
             # other dev files — inflating token usage by ~10k for no benefit.
-            _context_cwd = os.getenv("TERMINAL_CWD") or None
+            # Per-agent ``self.working_dir`` takes precedence so workflow
+            # agents with a workdir pin discover context files in their own
+            # worktree rather than whatever TERMINAL_CWD the shared process
+            # env happens to point at.
+            _context_cwd = self.working_dir or _get_terminal_cwd_safe()
             context_files_prompt = build_context_files_prompt(
                 cwd=_context_cwd, skip_soul=_soul_loaded)
             if context_files_prompt:
@@ -7600,6 +7631,38 @@ class AIAgent:
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 
+    def _apply_working_dir(self) -> None:
+        """Bind ``self.working_dir`` to the per-agent workdir context.
+
+        We publish the value through two channels:
+
+        * ``agent.workdir_ctx`` ContextVar — true per-agent isolation.
+          ``contextvars`` is inherited by ``ThreadPoolExecutor`` workers
+          and asyncio tasks, so concurrent agents in the workflow engine
+          each see their own worktree regardless of what peers write.
+        * ``os.environ["TERMINAL_CWD"]`` — legacy fallback for subprocess
+          tools and external integrations that haven't been migrated to
+          read the ContextVar yet.  This is inherently racy between
+          threads; tools that care about correctness read through
+          ``agent.workdir_ctx.get_terminal_cwd()`` which prefers the
+          ContextVar.
+
+        When ``self.working_dir`` is None we leave both untouched so that
+        CLI single-agent usage (which may rely on ``TERMINAL_CWD`` set
+        elsewhere) keeps working.
+        """
+        if not self.working_dir:
+            return
+        try:
+            from agent.workdir_ctx import set_terminal_cwd
+            # set_terminal_cwd also syncs os.environ, so terminal/
+            # code_execution tools that haven't switched to the new
+            # helper still land in the right place during this turn.
+            set_terminal_cwd(self.working_dir)
+        except Exception as exc:
+            logger.warning("AIAgent: failed to apply working_dir=%s: %s",
+                           self.working_dir, exc)
+
     def _restore_primary_runtime(self) -> bool:
         """Restore the primary runtime at the start of a new turn.
 
@@ -9102,6 +9165,14 @@ class AIAgent:
         independent: read-only tools may always share the parallel path, while
         file reads/writes may do so only when their target paths do not overlap.
         """
+        # Re-assert this agent's working_dir into TERMINAL_CWD just before
+        # any tool dispatch.  When multiple AIAgent instances run in parallel
+        # threads (workflow iteration/parallel), each agent owns a separate
+        # working_dir; another thread may have overwritten the env var between
+        # turns, so we restore ours here to keep terminal/code_execution
+        # tools in our worktree.
+        self._apply_working_dir()
+
         tool_calls = assistant_message.tool_calls
 
         # Allow _vprint during tool execution even with stream consumers
@@ -9298,7 +9369,7 @@ class AIAgent:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                        cwd = function_args.get("workdir") or self.working_dir or _get_terminal_cwd_safe(os.getcwd())
                         self._checkpoint_mgr.ensure_checkpoint(
                             cwd, f"before terminal: {cmd[:60]}"
                         )
@@ -9679,7 +9750,7 @@ class AIAgent:
                 try:
                     cmd = function_args.get("command", "")
                     if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                        cwd = function_args.get("workdir") or self.working_dir or _get_terminal_cwd_safe(os.getcwd())
                         self._checkpoint_mgr.ensure_checkpoint(
                             cwd, f"before terminal: {cmd[:60]}"
                         )
@@ -10179,6 +10250,12 @@ class AIAgent:
         # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
         # Installed once, transparent when streams are healthy, prevents crash on write.
         _install_safe_stdio()
+
+        # Sync per-agent working_dir into TERMINAL_CWD so terminal/code_execution
+        # tools land in the right worktree.  Re-asserted here every turn so
+        # that concurrent agents (e.g. workflow iteration with max_concurrent)
+        # each restore their own worktree before dispatching tools.
+        self._apply_working_dir()
 
         # Tag all log records on this thread with the session ID so
         # ``hermes logs --session <id>`` can filter a single conversation.
