@@ -3062,6 +3062,26 @@ def cmd_cron(args):
     cron_command(args)
 
 
+def cmd_workflow(args):
+    """Workflow management and execution."""
+    from workflow.cli import handle_workflow_command
+    # Build argv-style args for the workflow CLI dispatcher
+    wf_args = []
+    wf_cmd = getattr(args, 'workflow_command', None)
+    if wf_cmd:
+        wf_args.append(wf_cmd)
+    wf_id = getattr(args, 'workflow_id', None)
+    if wf_id:
+        wf_args.append(wf_id)
+    wf_file = getattr(args, 'workflow_file', None)
+    if wf_file:
+        wf_args.append(wf_file)
+    wf_inputs = getattr(args, 'workflow_inputs', None)
+    if wf_inputs:
+        wf_args.extend(["--inputs", wf_inputs])
+    handle_workflow_command(wf_args)
+
+
 def cmd_webhook(args):
     """Webhook subscription management."""
     from hermes_cli.webhook import webhook_command
@@ -5264,6 +5284,42 @@ For more help on a command:
     cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
 
     cron_parser.set_defaults(func=cmd_cron)
+
+    # =========================================================================
+    # workflow command
+    # =========================================================================
+    workflow_parser = subparsers.add_parser(
+        "workflow",
+        help="Workflow management and execution",
+        description="Manage and run DAG-based workflows with script, agent, and iterate nodes",
+    )
+    workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_command")
+
+    # workflow list
+    workflow_subparsers.add_parser("list", help="List all workflows")
+
+    # workflow show
+    wf_show = workflow_subparsers.add_parser("show", help="Show workflow definition")
+    wf_show.add_argument("workflow_id", help="Workflow ID to show")
+
+    # workflow create
+    wf_create = workflow_subparsers.add_parser("create", help="Create workflow from JSON file")
+    wf_create.add_argument("workflow_file", help="Path to workflow JSON file")
+
+    # workflow delete
+    wf_delete = workflow_subparsers.add_parser("delete", help="Delete a workflow")
+    wf_delete.add_argument("workflow_id", help="Workflow ID to delete")
+
+    # workflow run
+    wf_run = workflow_subparsers.add_parser("run", help="Execute a workflow")
+    wf_run.add_argument("workflow_id", help="Workflow ID to run")
+    wf_run.add_argument("--inputs", help="JSON string of input variables")
+
+    # workflow runs
+    wf_runs = workflow_subparsers.add_parser("runs", help="List runs for a workflow")
+    wf_runs.add_argument("workflow_id", help="Workflow ID")
+
+    workflow_parser.set_defaults(func=cmd_workflow)
 
     # =========================================================================
     # webhook command
