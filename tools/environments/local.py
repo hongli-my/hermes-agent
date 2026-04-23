@@ -1,5 +1,6 @@
 """Local execution environment — spawn-per-call with session snapshot."""
 
+import logging
 import os
 import platform
 import shutil
@@ -7,6 +8,8 @@ import signal
 import subprocess
 import tempfile
 import time
+
+logger = logging.getLogger(__name__)
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 
@@ -358,6 +361,19 @@ class LocalEnvironment(BaseEnvironment):
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
 
+        # Defensive: if self.cwd was deleted (e.g. /tmp cleaned up), fall back
+        # to a known-existing directory so subprocess.Popen doesn't raise
+        # FileNotFoundError.
+        effective_cwd = self.cwd
+        if not os.path.isdir(effective_cwd):
+            fallback = os.getcwd()
+            logger.warning(
+                "CWD %s no longer exists (possibly /tmp cleaned up), "
+                "falling back to %s for command execution",
+                effective_cwd, fallback,
+            )
+            effective_cwd = fallback
+
         proc = subprocess.Popen(
             args,
             text=True,
@@ -368,7 +384,7 @@ class LocalEnvironment(BaseEnvironment):
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             preexec_fn=None if _IS_WINDOWS else os.setsid,
-            cwd=self.cwd,
+            cwd=effective_cwd,
         )
         if not _IS_WINDOWS:
             try:
@@ -452,12 +468,28 @@ class LocalEnvironment(BaseEnvironment):
                 pass
 
     def _update_cwd(self, result: dict):
-        """Read CWD from temp file (local-only, no round-trip needed)."""
+        """Read CWD from temp file (local-only, no round-trip needed).
+
+        If the persisted CWD no longer exists (e.g. /tmp was cleaned up),
+        fall back to the process's current working directory so subsequent
+        commands don't crash with FileNotFoundError in subprocess.Popen.
+        """
         try:
             with open(self._cwd_file) as f:
                 cwd_path = f.read().strip()
             if cwd_path:
-                self.cwd = cwd_path
+                if os.path.isdir(cwd_path):
+                    self.cwd = cwd_path
+                else:
+                    # Persisted directory was deleted (common for /tmp paths
+                    # after system reboot or tmpwatch).  Fall back to a
+                    # directory we know exists.
+                    fallback = os.getcwd()
+                    logger.warning(
+                        "Persisted cwd %s no longer exists, falling back to %s",
+                        cwd_path, fallback,
+                    )
+                    self.cwd = fallback
         except (OSError, FileNotFoundError):
             pass
 
