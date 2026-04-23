@@ -844,6 +844,8 @@ def _get_env_config() -> Dict[str, Any]:
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
     cwd = os.getenv("TERMINAL_CWD", default_cwd)
+    logger.info("terminal: env_type=%s, TERMINAL_CWD=%s, default_cwd=%s, resolved cwd=%s",
+                 env_type, os.getenv("TERMINAL_CWD", "<unset>"), default_cwd, cwd)
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
@@ -855,6 +857,7 @@ def _get_env_config() -> Dict[str, Any]:
         ):
             host_cwd = candidate
             cwd = "/workspace"
+            logger.info("terminal: docker cwd passthrough, remapping host=%s to /workspace", host_cwd)
     elif env_type in ("modal", "docker", "singularity", "daytona") and cwd:
         # Host paths and relative paths that won't work inside containers
         is_host_path = any(cwd.startswith(p) for p in host_prefixes)
@@ -1504,6 +1507,14 @@ def terminal_tool(
                 _last_activity[effective_task_id] = time.time()
                 env = _active_environments[effective_task_id]
                 needs_creation = False
+                # Sync env.cwd with current TERMINAL_CWD so that workflow
+                # engine workdir changes take effect even when the
+                # environment is reused across iteration items.
+                terminal_cwd = os.getenv("TERMINAL_CWD")
+                if terminal_cwd and os.path.isdir(terminal_cwd):
+                    logger.info("terminal: syncing env.cwd to TERMINAL_CWD=%s (task %s, was cwd=%s)",
+                                 terminal_cwd, effective_task_id[:8], env.cwd)
+                    env.cwd = terminal_cwd
             else:
                 needs_creation = True
 
@@ -1631,6 +1642,14 @@ def terminal_tool(
                     "error": workdir_error,
                     "status": "blocked"
                 }, ensure_ascii=False)
+
+            # Auto-create workdir if it doesn't exist
+            if not os.path.exists(workdir):
+                try:
+                    os.makedirs(workdir, exist_ok=True)
+                    logger.debug("Auto-created workdir: %s", workdir)
+                except Exception as e:
+                    logger.warning("Failed to create workdir %s: %s", workdir, e)
 
         # Prepare command for execution
         pty_disabled_reason = None

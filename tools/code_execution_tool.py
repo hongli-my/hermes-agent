@@ -791,11 +791,17 @@ def _execute_remote(
         if tz:
             env_prefix += f" TZ={tz}"
 
-        # Execute the script on the remote backend
-        logger.info("Executing code on %s backend (task %s)...",
-                     env_type, effective_task_id[:8])
+        # Execute the script on the remote backend.
+        # Resolve the working directory the same way as the local path:
+        # project mode → TERMINAL_CWD (or cwd), strict mode → sandbox staging dir.
+        _mode = _get_execution_mode()
+        _remote_cwd = _resolve_child_cwd(_mode, sandbox_dir)
+        quoted_remote_cwd = shlex.quote(_remote_cwd)
+
+        logger.info("Executing code on %s backend (task %s, mode=%s, cwd=%s)...",
+                     env_type, effective_task_id[:8], _mode, _remote_cwd)
         script_result = env.execute(
-            f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
+            f"cd {quoted_remote_cwd} && {env_prefix} python3 {quoted_sandbox_dir}/script.py",
             timeout=timeout,
         )
 
@@ -1058,6 +1064,8 @@ def execute_code(
         _child_python = _resolve_child_python(_mode)
         _child_cwd = _resolve_child_cwd(_mode, tmpdir)
         _script_path = os.path.join(tmpdir, "script.py")
+
+        logger.info("execute_code (local): mode=%s, python=%s, cwd=%s",_mode, _child_python, _child_cwd)
 
         proc = subprocess.Popen(
             [_child_python, _script_path],
@@ -1425,15 +1433,21 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
       Popen with a nonexistent cwd.
     """
     if mode != "project":
+        logger.debug("execute_code _resolve_child_cwd: strict mode, using staging_dir=%s", staging_dir)
         return staging_dir
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
         expanded = os.path.expanduser(raw)
         if os.path.isdir(expanded):
+            logger.debug("execute_code _resolve_child_cwd: project mode, TERMINAL_CWD=%s", expanded)
             return expanded
+        else:
+            logger.warning("execute_code _resolve_child_cwd: TERMINAL_CWD=%s is not a valid dir, falling back", expanded)
     here = os.getcwd()
     if os.path.isdir(here):
+        logger.debug("execute_code _resolve_child_cwd: project mode, fallback os.getcwd()=%s", here)
         return here
+    logger.warning("execute_code _resolve_child_cwd: all fallbacks failed, using staging_dir=%s", staging_dir)
     return staging_dir
 
 

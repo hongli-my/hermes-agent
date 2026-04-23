@@ -118,6 +118,8 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
         base = _get_live_tracking_cwd(task_id) or os.environ.get(
             "TERMINAL_CWD", os.getcwd()
         )
+        logger.debug("file_tools: resolving relative path %r against base=%s (task=%s)",
+                     filepath, base, task_id)
         p = Path(base) / p
     return p.resolve()
 
