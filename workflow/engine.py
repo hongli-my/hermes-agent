@@ -602,7 +602,6 @@ def run_workflow(workflow: Dict[str, Any], inputs: Optional[Dict[str, Any]] = No
         "duration_seconds": duration,
         "inputs": merged_inputs,
         "outputs": execution_result.get("outputs", {}),
-        "final_output": execution_result.get("final_output", {}),
         "errors": execution_result.get("errors", []),
     })
 
@@ -648,14 +647,9 @@ def _run_workflow_linear(nodes: Dict, edges: List, pool: VarPool,
             logger.error("Workflow[%s]: %s", run_id, error_msg)
             break
 
-    # Last node output is the final output
-    final_node_id = execution_order[-1] if execution_order else None
-    final_output = pool.get_step_output(final_node_id) if final_node_id else {}
-
     return {
         "status": "error" if errors else "ok",
         "outputs": all_outputs,
-        "final_output": final_output,
         "errors": errors,
     }
 
@@ -738,16 +732,9 @@ def _run_workflow_with_branches(workflow: Dict, nodes: Dict, edges: List,
                 if next_id not in visited:
                     queue.append(next_id)
 
-    # Final output = last executed node's output
-    final_output = {}
-    if visited:
-        last_node = list(visited)[-1]
-        final_output = pool.get_step_output(last_node) or {}
-
     return {
         "status": "error" if errors else "ok",
         "outputs": all_outputs,
-        "final_output": final_output,
         "errors": errors,
     }
 

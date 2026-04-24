@@ -226,6 +226,26 @@ def _parse_inputs(args: list) -> dict:
     return inputs
 
 
+def _is_iteration_result(step_result: dict) -> bool:
+    return "results" in step_result and isinstance(step_result["results"], list)
+
+
+def _innermost_output(output: dict) -> str:
+    """Follow the 'output' chain to get the deepest non-dict value."""
+    while isinstance(output, dict) and "output" in output:
+        output = output["output"]
+    if isinstance(output, dict):
+        # just show first key
+        first_key = next(iter(output), None)
+        if first_key is not None:
+            v = output[first_key]
+            s = json.dumps(v, ensure_ascii=False)
+            return s[:60] + ("..." if len(s) > 60 else "")
+        return "{}"
+    s = json.dumps(output, ensure_ascii=False)
+    return s[:60] + ("..." if len(s) > 60 else "")
+
+
 def _print_run_result(result: dict):
     """Print a workflow run result."""
     status = result["status"]
@@ -252,18 +272,42 @@ def _print_run_result(result: dict):
             has_error = "__error__" in step_result
             icon = "❌" if has_error else "✅"
 
+            print(f"  {icon} {step_id} ({step_type}, {step_dur}s)")
+
+            # Special formatting for iteration results (don't indent the whole dict)
+            if not has_error and _is_iteration_result(step_result):
+                # Collect preview lines without base indent
+                preview_lines = []
+                results = step_result["results"]
+                shown = results[:3]
+                for item in shown:
+                    idx = item["index"]
+                    item_val = item["item"]
+                    output = item.get("output", {})
+                    display_val = _innermost_output(output)
+                    item_str = json.dumps(item_val, ensure_ascii=False)
+                    if len(item_str) > 40:
+                        item_str = item_str[:40] + "..."
+                    preview_lines.append(f"[{idx}] {item_str} → {display_val}")
+                for line in preview_lines:
+                    print(f"    {line}")
+                if len(results) > 3:
+                    print(f"    ... (+{len(results) - 3} more)")
+                if step_result.get("__errors__"):
+                    print(f"    ⚠ {len(step_result['__errors__'])} errors")
+                continue
+
             # Truncate output for display
             preview = ""
             if has_error:
                 preview = step_result["__error__"][:100]
             else:
-                for key, val in step_result.items():
-                    if key.startswith("__"):
+                for k, val in step_result.items():
+                    if k.startswith("__"):
                         continue
                     val_str = val if isinstance(val, str) else json.dumps(val, ensure_ascii=False)
-                    preview += f"  {key}: {val_str[:80]}{'...' if len(val_str) > 80 else ''}\n"
+                    preview += f"  {k}: {val_str[:80]}{'...' if len(val_str) > 80 else ''}\n"
 
-            print(f"  {icon} {step_id} ({step_type}, {step_dur}s)")
             if preview:
                 for line in preview.strip().split("\n"):
                     print(f"    {line}")
