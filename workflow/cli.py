@@ -14,6 +14,7 @@ Usage:
 
 import json
 import sys
+import threading
 from pathlib import Path
 
 
@@ -378,7 +379,17 @@ def _parse_inputs(args: list) -> dict:
             key, val = arg.split("=", 1)
             # Try to parse value as JSON, fall back to string
             try:
-                inputs[key] = json.loads(val)
+                parsed = json.loads(val)
+                # If the parsed value is a number but the original string
+                # looks like it could be an identifier (e.g., date, id, code),
+                # keep it as string to avoid type confusion
+                if isinstance(parsed, (int, float)) and val.isdigit():
+                    # For pure numeric strings that might be identifiers,
+                    # keep them as strings to preserve leading zeros and
+                    # avoid type issues in scripts
+                    inputs[key] = val
+                else:
+                    inputs[key] = parsed
             except json.JSONDecodeError:
                 inputs[key] = val
     return inputs
