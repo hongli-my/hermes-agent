@@ -93,41 +93,50 @@ def render(template: Union[str, Dict, List, Any], pool: VarPool) -> Any:
 
 
 def _render_string(text: str, pool: VarPool) -> Any:
-    """Replace all {{...}} patterns in a string.
+    """Replace all ``{{...}}`` patterns in *text*.
 
-    If the entire string is a single variable reference and the resolved
-    value is not a string, return the raw value directly (e.g., a list or dict).
+    Return-type rules (intentional, to avoid surprising coercions):
 
-    If the rendered result looks like a JSON value, auto-parse it.
+    1. If the whole input is a single variable reference (optionally
+       surrounded by whitespace) — e.g. ``"{{steps.x.output.stocks}}"`` —
+       return the resolved value **as-is**, preserving its original type
+       (``list`` / ``dict`` / ``int`` / ``bool`` / ...).  This is the
+       common "pass-through" case used to forward a structured output
+       from one step to the next.
+
+    2. Otherwise (mixed text / multi-var template / prompt body) the
+       result is returned as a ``str``.  Non-string substitutions are
+       JSON-encoded so they embed cleanly, but we do **not** attempt to
+       ``json.loads`` the final string back into a Python object — doing
+       so silently mis-typed legitimate prose that merely happened to
+       start with ``[``, ``{`` or ``"`` (Markdown lists, prompts that
+       describe JSON, narrative quotes, etc.).
+
+    Unresolved placeholders (``{{missing}}``) are left intact so the
+    caller can detect them instead of silently dropping content.
     """
-    # Check if the entire string is a single variable reference
+    # Case 1 — whole string is a single variable reference.
     single_var = _VAR_PATTERN.fullmatch(text.strip())
     if single_var:
         value = _resolve_expr(single_var.group(1), pool)
         if value is not None and not isinstance(value, str):
-            return value  # Return list/dict/number directly
+            return value  # pass through list/dict/number/bool unchanged
+        if value is not None:
+            return value  # raw string value, no further coercion
 
+    # Case 2 — mixed content; do placeholder substitution only.
     def _replacer(match):
         expr = match.group(1)
         value = _resolve_expr(expr, pool)
         if value is None:
-            return match.group(0)  # Leave unresolved
+            return match.group(0)  # leave unresolved so caller can tell
         if isinstance(value, str):
             return value
+        # JSON-encode structured values so they embed without breaking
+        # quoting in the surrounding prose.
         return json.dumps(value, ensure_ascii=False)
 
-    result = _VAR_PATTERN.sub(_replacer, text)
-
-    # If the result looks like a JSON value, try to parse it
-    stripped = result.strip()
-    if stripped and stripped[0] in ('[', '{', '"') and not _VAR_PATTERN.search(stripped):
-        try:
-            parsed = json.loads(stripped)
-            return parsed
-        except json.JSONDecodeError:
-            pass
-
-    return result
+    return _VAR_PATTERN.sub(_replacer, text)
 
 
 def _resolve_expr(expr: str, pool: VarPool) -> Any:

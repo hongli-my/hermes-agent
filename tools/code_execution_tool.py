@@ -1435,14 +1435,19 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
     if mode != "project":
         logger.debug("execute_code _resolve_child_cwd: strict mode, using staging_dir=%s", staging_dir)
         return staging_dir
-    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    # Prefer the per-agent ContextVar so concurrent agents in the workflow
+    # engine each resolve to their own worktree.  Falls back to the
+    # TERMINAL_CWD env var for CLI / external integrations that never touch
+    # the ContextVar.
+    from agent.workdir_ctx import get_terminal_cwd
+    raw = (get_terminal_cwd() or "").strip()
     if raw:
         expanded = os.path.expanduser(raw)
         if os.path.isdir(expanded):
-            logger.debug("execute_code _resolve_child_cwd: project mode, TERMINAL_CWD=%s", expanded)
+            logger.debug("execute_code _resolve_child_cwd: project mode, workdir=%s", expanded)
             return expanded
         else:
-            logger.warning("execute_code _resolve_child_cwd: TERMINAL_CWD=%s is not a valid dir, falling back", expanded)
+            logger.warning("execute_code _resolve_child_cwd: workdir=%s is not a valid dir, falling back", expanded)
     here = os.getcwd()
     if os.path.isdir(here):
         logger.debug("execute_code _resolve_child_cwd: project mode, fallback os.getcwd()=%s", here)

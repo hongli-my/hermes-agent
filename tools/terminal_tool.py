@@ -843,13 +843,20 @@ def _get_env_config() -> Dict[str, Any]:
     # If Docker cwd passthrough is explicitly enabled, remap the host path to
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
-    logger.info("terminal: env_type=%s, TERMINAL_CWD=%s, default_cwd=%s, resolved cwd=%s",
-                 env_type, os.getenv("TERMINAL_CWD", "<unset>"), default_cwd, cwd)
+    #
+    # Prefer the per-agent ContextVar over the process-global env so that
+    # concurrent AIAgent instances (workflow iteration / parallel branches)
+    # each see their own worktree.  Falls back to TERMINAL_CWD env when the
+    # ContextVar is unset (CLI mode / external callers).
+    from agent.workdir_ctx import get_terminal_cwd
+    ctx_cwd = get_terminal_cwd()
+    cwd = ctx_cwd or default_cwd
+    logger.info("terminal: env_type=%s, ctx_cwd=%s, default_cwd=%s, resolved cwd=%s",
+                 env_type, ctx_cwd or "<unset>", default_cwd, cwd)
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
+        docker_cwd_source = ctx_cwd or os.getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in host_prefixes)
@@ -1507,12 +1514,15 @@ def terminal_tool(
                 _last_activity[effective_task_id] = time.time()
                 env = _active_environments[effective_task_id]
                 needs_creation = False
-                # Sync env.cwd with current TERMINAL_CWD so that workflow
-                # engine workdir changes take effect even when the
-                # environment is reused across iteration items.
-                terminal_cwd = os.getenv("TERMINAL_CWD")
+                # Sync env.cwd with current per-agent workdir so that
+                # workflow engine workdir changes take effect even when
+                # the environment is reused across iteration items.
+                # Reads from the per-agent ContextVar first, falling back
+                # to TERMINAL_CWD env when unset (CLI / external callers).
+                from agent.workdir_ctx import get_terminal_cwd
+                terminal_cwd = get_terminal_cwd()
                 if terminal_cwd and os.path.isdir(terminal_cwd):
-                    logger.info("terminal: syncing env.cwd to TERMINAL_CWD=%s (task %s, was cwd=%s)",
+                    logger.info("terminal: syncing env.cwd to workdir=%s (task %s, was cwd=%s)",
                                  terminal_cwd, effective_task_id[:8], env.cwd)
                     env.cwd = terminal_cwd
             else:

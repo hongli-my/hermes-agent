@@ -104,24 +104,6 @@ def _ensure_dirs():
     _get_workflows_dir().mkdir(parents=True, exist_ok=True)
 
 
-def _set_terminal_cwd(workdir: Optional[str]):
-    """Set TERMINAL_CWD env var for agent's terminal commands.
-    
-    Args:
-        workdir: Absolute path or None to clear. Supports variable rendering
-                 via render() before calling this function.
-    """
-    if workdir:
-        resolved = Path(workdir).expanduser().resolve()
-        resolved.mkdir(parents=True, exist_ok=True)
-        os.environ["TERMINAL_CWD"] = str(resolved)
-        logger.info("TERMINAL_CWD set to %s (requested: %s)", resolved, workdir)
-    elif "TERMINAL_CWD" in os.environ:
-        old = os.environ["TERMINAL_CWD"]
-        del os.environ["TERMINAL_CWD"]
-        logger.info("TERMINAL_CWD cleared (was: %s)", old)
-
-
 # ---------------------------------------------------------------------------
 # Script node executor
 # ---------------------------------------------------------------------------
@@ -168,6 +150,13 @@ def _run_script_node(node: Dict[str, Any], pool: VarPool,
         script_workdir = str(resolved.parent)  # Default: script's directory
 
     try:
+        # Build child env: inherit from parent but override TERMINAL_CWD with
+        # this script's resolved working dir, so scripts that read the env var
+        # still see the right worktree even when concurrent peers have
+        # overwritten the parent process's env.
+        child_env = os.environ.copy()
+        child_env["TERMINAL_CWD"] = script_workdir
+
         result = subprocess.run(
             [sys.executable, str(resolved)],
             input=json.dumps(input_data, ensure_ascii=False),
@@ -175,7 +164,7 @@ def _run_script_node(node: Dict[str, Any], pool: VarPool,
             text=True,
             timeout=timeout,
             cwd=script_workdir,
-            env=os.environ.copy(),
+            env=child_env,
         )
 
         # Log stderr if present
@@ -279,28 +268,10 @@ def _run_agent_node(node: Dict[str, Any], pool: VarPool,
     except Exception as exc:
         return {"__error__": f"Provider resolution failed: {exc}"}
 
-    # Smart routing
-    try:
-        from agent.smart_model_routing import resolve_turn_route
-        smart_routing = _cfg.get("smart_model_routing", {}) or {}
-        turn_route = resolve_turn_route(
-            prompt, smart_routing,
-            {
-                "model": model,
-                "api_key": runtime.get("api_key"),
-                "base_url": runtime.get("base_url"),
-                "provider": runtime.get("provider"),
-                "api_mode": runtime.get("api_mode"),
-                "command": runtime.get("command"),
-                "args": list(runtime.get("args") or []),
-            },
-        )
-    except Exception:
-        # Fallback without smart routing
-        turn_route = {
-            "model": model,
-            "runtime": runtime,
-        }
+    turn_route = {
+        "model": model,
+        "runtime": runtime,
+    }
 
     max_iterations = node.get("max_iterations", 30)
     enabled_toolsets = node.get("toolsets")
@@ -325,19 +296,22 @@ def _run_agent_node(node: Dict[str, Any], pool: VarPool,
 
     system_prompt = node.get("system_prompt")
 
-    # Set TERMINAL_CWD for this agent node's terminal commands.
-    # Priority: node's own workdir > default_workdir (from iteration/parallel) > keep caller's setting
-    workdir = node.get("workdir")
-    if workdir:
-        workdir = render(str(workdir), pool)
-        logger.info("Agent node '%s': using node workdir=%s", node.get("id", "?"), workdir)
-        _set_terminal_cwd(workdir)
+    # Resolve the effective working_dir for this agent node.
+    # Priority: node's own workdir > default_workdir (from iteration/parallel) > None.
+    # Pass it as a constructor arg so the agent can re-assert TERMINAL_CWD
+    # into os.environ before every tool dispatch.  This keeps concurrent
+    # agents isolated without needing a process-global lock on the env.
+    node_workdir = node.get("workdir")
+    if node_workdir:
+        node_workdir = render(str(node_workdir), pool)
+        logger.info("Agent node '%s': using node workdir=%s", node.get("id", "?"), node_workdir)
+        effective_working_dir = node_workdir
     elif default_workdir:
         logger.info("Agent node '%s': using default_workdir=%s", node.get("id", "?"), default_workdir)
-        _set_terminal_cwd(default_workdir)
+        effective_working_dir = default_workdir
     else:
-        logger.info("Agent node '%s': no workdir specified, keeping current TERMINAL_CWD=%s",
-                     node.get("id", "?"), os.getenv("TERMINAL_CWD", "<unset>"))
+        logger.info("Agent node '%s': no workdir specified", node.get("id", "?"))
+        effective_working_dir = None
 
     agent = AIAgent(
         model=turn_route.get("model", model),
@@ -355,6 +329,7 @@ def _run_agent_node(node: Dict[str, Any], pool: VarPool,
         skip_memory=True,
         platform="workflow",
         session_db=session_db,
+        working_dir=effective_working_dir,
     )
 
     try:
@@ -382,6 +357,19 @@ def _run_agent_node(node: Dict[str, Any], pool: VarPool,
 
     except Exception as e:
         return {"__error__": f"Agent execution failed: {e}"}
+    finally:
+        # Prevent session_id from leaking to the next agent that happens
+        # to land on this reused ThreadPoolExecutor worker thread.
+        # ``set_session_context`` is backed by ``threading.local`` in
+        # ``hermes_logging``; without an explicit clear, any log record
+        # emitted between this worker being reassigned and the next
+        # agent's ``run_conversation`` setting its own session_id would
+        # inherit the previous agent's tag.
+        try:
+            from hermes_logging import clear_session_context
+            clear_session_context()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +486,6 @@ def _run_iteration_sequential(node, pool, items, item_var, sub_steps,
             iter_workdir = render(str(iter_workdir_template), pool)
         logger.info("Iteration item %d/%d (%s=%r): iter_workdir=%s",
                      i + 1, len(items), item_var, item, iter_workdir)
-        _set_terminal_cwd(iter_workdir)
 
         # Execute sub_steps sequentially
         iter_output = {}
@@ -521,7 +508,6 @@ def _run_iteration_sequential(node, pool, items, item_var, sub_steps,
             effective_workdir = sub_workdir or iter_workdir
             logger.info("Sub-step '%s' workdir: sub=%s, iter=%s, effective=%s",
                          sub_id, sub_workdir, iter_workdir, effective_workdir)
-            _set_terminal_cwd(effective_workdir)
 
             if sub_type == "script":
                 sub_result = _run_script_node(sub_step, pool,
@@ -566,10 +552,7 @@ def _run_iteration_sequential(node, pool, items, item_var, sub_steps,
                 "output": iter_output,
             })
 
-    # Clean up: reset workdir after iteration completes to avoid leaking
-    logger.info("Iteration complete: resetting TERMINAL_CWD")
-    _set_terminal_cwd(None)
-
+    # Iteration complete — workdir passed via arg, nothing to clean up at env level
     output = {output_key: results}
     if errors:
         output["__errors__"] = errors
@@ -602,9 +585,6 @@ def _run_iteration_concurrent(node, pool, items, item_var, sub_steps,
     if iter_workdir_template:
         iter_workdir = render(str(iter_workdir_template), pool)
     logger.info("Iteration concurrent: iter_workdir=%s (shared by all items)", iter_workdir)
-
-    # 并发前设一次 TERMINAL_CWD，所有线程共享同一个值
-    _set_terminal_cwd(iter_workdir)
 
     def _process_item(i, item):
         """单个 item 的处理逻辑，在线程中执行。"""
@@ -719,9 +699,8 @@ def _run_iteration_concurrent(node, pool, items, item_var, sub_steps,
                 if stop_on_error:
                     cancel_event.set()
 
-    # 清理 TERMINAL_CWD，避免泄漏到外层节点
-    logger.info("Iteration concurrent complete: resetting TERMINAL_CWD")
-    _set_terminal_cwd(None)
+    # 并发迭代完成 — workdir 通过构造参数透传给每个 AIAgent，
+    # 不再依赖进程级 TERMINAL_CWD，所以无需在此清理 env。
 
     # 合并结果到主 pool（按顺序，只合并非错误的结果）
     valid_results = [r for r in results if r is not None and "__error__" not in r]
@@ -790,11 +769,6 @@ def _execute_single_node(node: Dict[str, Any], pool: VarPool,
     """Dispatch to the right executor based on node type."""
     node_type = node.get("type", "agent")
 
-    # Reset TERMINAL_CWD before each node (avoid workdir leaking between nodes)
-    logger.info("Node '%s' (type=%s): resetting TERMINAL_CWD before execution",
-                 node.get("id", "?"), node_type)
-    _set_terminal_cwd(None)
-
     if node_type == "script":
         return _run_script_node(node, pool)
     elif node_type == "agent":
@@ -861,6 +835,25 @@ def run_workflow(workflow: Dict[str, Any], inputs: Optional[Dict[str, Any]] = No
             "run_id": run_id,
         }
 
+    # Full structural validation (cycle detection, edge endpoints,
+    # if-branch targets, required fields, concurrent-iteration workdir
+    # placement).  Previously the engine only checked ``not nodes`` and
+    # deferred the rest to the CLI layer, which meant programmatic
+    # callers of ``run_workflow`` would hit runtime errors deep inside
+    # execution instead of getting a clean up-front failure.
+    try:
+        validation_errors = validate_workflow(workflow)
+    except Exception as exc:  # defensive — bad workflow shape
+        validation_errors = [f"validate_workflow raised: {exc}"]
+    if validation_errors:
+        return {
+            "status": "error",
+            "outputs": {},
+            "errors": validation_errors,
+            "duration_seconds": 0,
+            "run_id": run_id,
+        }
+
     # Initialize variable pool
     pool = VarPool(inputs=merged_inputs)
 
@@ -885,12 +878,18 @@ def run_workflow(workflow: Dict[str, Any], inputs: Optional[Dict[str, Any]] = No
     execution_result["duration_seconds"] = duration
     execution_result["run_id"] = run_id
 
-    _save_run_output(workflow.get("id", "unknown"), run_id, {
+    # Resolve a stable persistence key.  ``parse_yaml_workflow`` returns a
+    # dict without an ``id`` field unless the caller went through
+    # ``load_yaml_file``; falling back to ``"unknown"`` would collapse every
+    # programmatic run into one directory and silently overwrite outputs.
+    storage_id = _resolve_storage_id(workflow)
+
+    _save_run_output(storage_id, run_id, {
         "run_id": run_id,
         "workflow_name": workflow.get("name", "unnamed"),
-        "workflow_id": workflow.get("id", ""),
+        "workflow_id": workflow.get("id", "") or storage_id,
         "status": execution_result["status"],
-        "started_at": datetime.fromtimestamp(start_time).isoformat(),
+        "started_at": datetime.fromtimestamp(start_time).astimezone().isoformat(),
         "duration_seconds": duration,
         "inputs": merged_inputs,
         "outputs": execution_result.get("outputs", {}),
@@ -898,6 +897,26 @@ def run_workflow(workflow: Dict[str, Any], inputs: Optional[Dict[str, Any]] = No
     })
 
     return execution_result
+
+
+def _resolve_storage_id(workflow: Dict[str, Any]) -> str:
+    """Pick a filesystem-safe directory name for persisting run outputs.
+
+    Precedence: explicit ``id`` > sanitized ``name`` > ``"unknown"``.
+    Only word characters, dashes and underscores are kept; everything
+    else is collapsed to underscores so the directory stays within what
+    every platform can create.
+    """
+    wf_id = workflow.get("id")
+    if wf_id:
+        return str(wf_id)
+    name = workflow.get("name")
+    if name:
+        import re as _re
+        slug = _re.sub(r"[^\w.-]+", "_", str(name)).strip("_")
+        if slug:
+            return slug
+    return "unknown"
 
 
 def _run_workflow_linear(nodes: Dict, edges: List, pool: VarPool,
@@ -923,9 +942,9 @@ def _run_workflow_linear(nodes: Dict, edges: List, pool: VarPool,
         logger.info("Workflow[%s]: running node '%s' (type=%s)", run_id, node_id, node_type)
         node_start = time.time()
 
-        # Notify: node starting
+        # Notify: node starting (depth=0 — top-level node)
         if progress_callback:
-            progress_callback(node_id, node_type, "start", None, 0)
+            progress_callback(node_id, node_type, "start", None, 0, depth=0)
 
         result = _execute_single_node(node_def, pool, session_db=session_db,
                                        progress_callback=progress_callback)
@@ -942,7 +961,8 @@ def _run_workflow_linear(nodes: Dict, edges: List, pool: VarPool,
         # Notify: node completed
         has_error = "__error__" in result
         if progress_callback:
-            progress_callback(node_id, node_type, "ok" if not has_error else "error", result, round(node_duration, 2))
+            progress_callback(node_id, node_type, "ok" if not has_error else "error",
+                              result, round(node_duration, 2), depth=0)
 
         if has_error:
             error_msg = f"Node '{node_id}' failed: {result['__error__']}"
@@ -1008,9 +1028,9 @@ def _run_workflow_with_branches(workflow: Dict, nodes: Dict, edges: List,
 
         node_start = time.time()
 
-        # Notify: node starting
+        # Notify: node starting (depth=0 — top-level node)
         if progress_callback:
-            progress_callback(node_id, node_type, "start", None, 0)
+            progress_callback(node_id, node_type, "start", None, 0, depth=0)
 
         result = _execute_single_node(node_def, pool, session_db=session_db,
                                        progress_callback=progress_callback)
@@ -1026,7 +1046,8 @@ def _run_workflow_with_branches(workflow: Dict, nodes: Dict, edges: List,
         # Notify: node completed
         has_error = "__error__" in result
         if progress_callback:
-            progress_callback(node_id, node_type, "ok" if not has_error else "error", result, round(node_duration, 2))
+            progress_callback(node_id, node_type, "ok" if not has_error else "error",
+                              result, round(node_duration, 2), depth=0)
 
         if has_error:
             error_msg = f"Node '{node_id}' failed: {result['__error__']}"
