@@ -871,7 +871,7 @@ def _clear_backend_probe_cache() -> None:
     _BACKEND_PROBE_CACHE.clear()
 
 
-def build_environment_hints() -> str:
+def build_environment_hints(working_dir: Optional[str] = None) -> str:
     """Return environment-specific guidance for the system prompt.
 
     Always emits a factual block describing the execution environment:
@@ -886,6 +886,9 @@ def build_environment_hints() -> str:
       and cwd. Falls back to a static summary if the probe fails.
 
     The WSL environment hint is appended unchanged when running under WSL.
+
+    If *working_dir* is provided, it is used as the "Current working
+    directory" line instead of ``os.getcwd()`` (the gateway process cwd).
     """
     import platform
     import sys
@@ -910,7 +913,8 @@ def build_environment_hints() -> str:
 
         host_lines.append(f"User home directory: {os.path.expanduser('~')}")
         try:
-            host_lines.append(f"Current working directory: {resolve_agent_cwd()}")
+            _cwd = working_dir or resolve_agent_cwd()
+            host_lines.append(f"Current working directory: {_cwd}")
         except OSError:
             pass
 

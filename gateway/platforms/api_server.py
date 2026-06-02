@@ -19,6 +19,12 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- GET  /api/kanban/board            — full kanban board grouped by status column
+- GET  /api/kanban/tasks/{task_id}  — task detail with comments, events, runs, links
+- PATCH /api/kanban/tasks/{task_id} — update task status/assignee/priority/title/body
+- POST /api/kanban/tasks            — create a new kanban task
+- POST /api/kanban/tasks/{task_id}/comments — add a comment to a task
+- POST /api/kanban/dispatch         — trigger one dispatcher tick
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -58,6 +64,13 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+
+try:
+    from hermes_cli import kanban_db as _kanban_db
+    KANBAN_AVAILABLE = True
+except ImportError:
+    _kanban_db = None  # type: ignore[assignment]
+    KANBAN_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +117,12 @@ def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
 
 _TRUE_REQUEST_BOOL_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSE_REQUEST_BOOL_STRINGS = frozenset({"0", "false", "no", "off"})
+
+# Kanban board column order — keep in sync with kanban_db.VALID_STATUSES.
+_KANBAN_BOARD_COLUMNS = [
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+]
+_KANBAN_CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
 def _coerce_request_bool(value: Any, default: bool = False) -> bool:
@@ -775,6 +794,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Last context info from most recent chat completion (for /api/context)
+        self._last_context_info: Dict[str, Any] = {}
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
@@ -782,6 +803,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self.gateway_runner: Optional[Any] = None  # Injected by GatewayRunner after creation
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1026,6 +1048,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        provider: Optional[str] = None,
+        working_dir: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1052,9 +1076,11 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         from hermes_cli.tools_config import _get_platform_tools
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_kwargs = _resolve_runtime_agent_kwargs(requested=provider)
         reasoning_config = GatewayRunner._load_reasoning_config()
-        model = _resolve_gateway_model()
+        # Use the model from runtime_kwargs (e.g. custom_providers[].model) when
+        # a specific provider was requested; otherwise fall back to config.yaml default.
+        model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -1083,6 +1109,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            working_dir=working_dir,
         )
         return agent
 
@@ -1488,8 +1515,9 @@ class APIServerAdapter(BasePlatformAdapter):
         session, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
+        cascade = request.query.get("cascade", "").lower() in ("true", "1")
         db = self._ensure_session_db()
-        deleted = db.delete_session(session_id)
+        deleted = db.delete_session(session_id, cascade=cascade)
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
@@ -1578,6 +1606,7 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        requested_provider = body.get("provider")
         history = self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -1585,6 +1614,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            provider=requested_provider,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -1623,6 +1653,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
 
+        requested_provider = body.get("provider")
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -1676,6 +1707,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    provider=requested_provider,
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -1762,6 +1794,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+
+        # Per-request working directory (passed to AIAgent)
+        working_dir = body.get("working_dir") or body.get("workdir") or None
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -1858,6 +1893,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
+        requested_provider = body.get("provider")
         created = int(time.time())
 
         if stream:
@@ -1923,6 +1959,37 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "completed",
                 }))
 
+            # ── Approval: route dangerous-command prompts to SSE ──
+            # Generate a run_id so the web client can call
+            # POST /v1/runs/{run_id}/approval to resolve.
+            _run_id = f"run_{uuid.uuid4().hex}"
+            _approval_session_key = gateway_session_key or session_id or _run_id
+            self._run_approval_sessions[_run_id] = _approval_session_key
+
+            def _on_approval(approval_data):
+                """Called from agent executor thread when a dangerous command
+                is detected.  Wraps the data into an ``approval.request`` SSE
+                event and injects it into the content stream queue so the web
+                client can render interactive approve/deny buttons."""
+                event = dict(approval_data or {})
+                event.update({
+                    "event": "approval.request",
+                    "run_id": _run_id,
+                    "timestamp": time.time(),
+                    "choices": ["once", "session", "always", "deny"],
+                })
+                # Register run status so POST /v1/runs/{run_id}/approval
+                # can find this run.  Without this, _handle_run_approval
+                # returns 404 because _run_statuses has no entry.
+                self._set_run_status(
+                    _run_id,
+                    "waiting_for_approval",
+                    last_event="approval.request",
+                    session_id=session_id,
+                )
+                self._run_streams[_run_id] = _stream_q
+                _stream_q.put(("__approval__", event))
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
@@ -1942,6 +2009,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                provider=requested_provider,
+                working_dir=working_dir,
+                approval_notify_callback=_on_approval,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1961,6 +2031,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                provider=requested_provider,
+                working_dir=working_dir,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2116,13 +2188,27 @@ class APIServerAdapter(BasePlatformAdapter):
                 frontends can display them without storing the markers in
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
+                Tagged tuples ``("__approval__", payload)`` are sent as a
+                custom ``event: approval.request`` SSE event so web clients
+                can render interactive approve/deny buttons.
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__approval__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: approval.request\ndata: {event_data}\n\n".encode()
+                    )
                 else:
+                    # Ensure only strings are sent as delta.content —
+                    # non-string objects (dicts, lists) would render as
+                    # "[object Object]" in the frontend.
+                    if not isinstance(item, str):
+                        logger.warning("Non-string delta in SSE stream: %r (type=%s), skipping", item, type(item).__name__)
+                        return time.monotonic()
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -3176,7 +3262,7 @@ class APIServerAdapter(BasePlatformAdapter):
     except ImportError:
         pass
 
-    _WF_ID_RE = __import__("re").compile(r"[a-f0-9\-]{8,36}")
+    _WF_ID_RE = __import__("re").compile(r"[a-zA-Z0-9_\-]{1,64}")
 
     def _check_workflow_available(self) -> Optional["web.Response"]:
         """Return error response if workflow module isn't available."""
@@ -3818,6 +3904,9 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        provider: Optional[str] = None,
+        working_dir: Optional[str] = None,
+        approval_notify_callback=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3829,6 +3918,10 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        If *approval_notify_callback* is provided, it is registered as a
+        gateway approval notification handler so dangerous-command prompts
+        are routed back to the caller (e.g. the SSE stream for web clients).
         """
         loop = asyncio.get_running_loop()
 
@@ -3850,6 +3943,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
+                    provider=provider,
+                    working_dir=working_dir,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
@@ -4134,6 +4229,18 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                         "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
                     }
+                    # Save context info for /api/context (same source as CLI status bar)
+                    comp = getattr(agent, "context_compressor", None)
+                    if comp:
+                        self._last_context_info = {
+                            "used_tokens": getattr(comp, "last_prompt_tokens", 0) or 0,
+                            "max_tokens": getattr(comp, "context_length", 0) or 0,
+                            "model": getattr(agent, "model", "") or getattr(comp, "model", "") or "",
+                            "cumulative_input": u["input_tokens"],
+                            "cumulative_output": u["output_tokens"],
+                            "session_id": getattr(agent, "session_id", effective_task_id) or effective_task_id,
+                            "updated_at": time.time(),
+                        }
                     return r, u
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
@@ -4470,6 +4577,638 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_statuses.pop(run_id, None)
 
     # ------------------------------------------------------------------
+    # Kanban board API handlers
+    # ------------------------------------------------------------------
+
+    def _kanban_conn(self, board: Optional[str] = None) -> sqlite3.Connection:
+        """Open a kanban_db connection, initializing schema on first use."""
+        if not KANBAN_AVAILABLE:
+            raise RuntimeError("kanban_db not available")
+        try:
+            _kanban_db.init_db(board=board)
+        except Exception as exc:
+            logger.warning("kanban init_db failed: %s", exc)
+        return _kanban_db.connect(board=board)
+
+    @staticmethod
+    def _kanban_task_dict(
+        task: Any,
+        *,
+        latest_summary: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Serialize a kanban Task dataclass into a JSON-friendly dict."""
+        from dataclasses import asdict
+        d = asdict(task)
+        try:
+            d["age"] = _kanban_db.task_age(task)
+        except Exception:
+            d["age"] = {"created_age_seconds": None, "started_age_seconds": None, "time_to_complete_seconds": None}
+        d["latest_summary"] = latest_summary
+        return d
+
+    @staticmethod
+    def _kanban_event_dict(event: Any) -> Dict[str, Any]:
+        return {
+            "id": event.id,
+            "task_id": event.task_id,
+            "kind": event.kind,
+            "payload": event.payload,
+            "created_at": event.created_at,
+            "run_id": event.run_id,
+        }
+
+    @staticmethod
+    def _kanban_comment_dict(c: Any) -> Dict[str, Any]:
+        return {
+            "id": c.id,
+            "task_id": c.task_id,
+            "author": c.author,
+            "body": c.body,
+            "created_at": c.created_at,
+        }
+
+    @staticmethod
+    def _kanban_run_dict(r: Any) -> Dict[str, Any]:
+        return {
+            "id": r.id,
+            "task_id": r.task_id,
+            "profile": r.profile,
+            "step_key": r.step_key,
+            "status": r.status,
+            "claim_lock": r.claim_lock,
+            "claim_expires": r.claim_expires,
+            "worker_pid": r.worker_pid,
+            "max_runtime_seconds": r.max_runtime_seconds,
+            "last_heartbeat_at": r.last_heartbeat_at,
+            "started_at": r.started_at,
+            "ended_at": r.ended_at,
+            "outcome": r.outcome,
+            "summary": r.summary,
+            "metadata": r.metadata,
+            "error": r.error,
+        }
+
+    @staticmethod
+    def _kanban_links_for(conn: sqlite3.Connection, task_id: str) -> Dict[str, List[str]]:
+        """Return {'parents': [...], 'children': [...]} for a task."""
+        parents = [
+            r["parent_id"]
+            for r in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+                (task_id,),
+            )
+        ]
+        children = [
+            r["child_id"]
+            for r in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                (task_id,),
+            )
+        ]
+        return {"parents": parents, "children": children}
+
+    @staticmethod
+    def _kanban_parents_blocking_ready(
+        conn: sqlite3.Connection, task_id: str,
+    ) -> List[Dict[str, Any]]:
+        """Return parent rows that aren't done and block a transition to ready."""
+        rows = conn.execute(
+            "SELECT t.id, t.title, t.status FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id "
+            "WHERE l.child_id = ? AND t.status != 'done'",
+            (task_id,),
+        ).fetchall()
+        return [
+            {"id": r["id"], "title": r["title"], "status": r["status"]}
+            for r in rows
+        ]
+
+    @staticmethod
+    def _kanban_set_status_direct(
+        conn: sqlite3.Connection, task_id: str, new_status: str,
+    ) -> bool:
+        """Direct status write for kanban drag-drop moves.
+
+        When transitioning OFF running, closes the active run with
+        outcome='reclaimed'. When moving TO ready, checks all parents
+        are done. Returns True on success.
+        """
+        with _kanban_db.write_txn(conn):
+            prev = conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if prev is None:
+                return False
+
+            # Guard: don't allow promoting to 'ready' unless all parents are done.
+            if new_status == "ready":
+                parent_statuses = conn.execute(
+                    "SELECT t.status FROM tasks t "
+                    "JOIN task_links l ON l.parent_id = t.id "
+                    "WHERE l.child_id = ?",
+                    (task_id,),
+                ).fetchall()
+                if parent_statuses and not all(
+                    p["status"] == "done" for p in parent_statuses
+                ):
+                    return False
+
+            was_running = prev["status"] == "running"
+            reopening_satisfied_parent = (
+                prev["status"] in {"done", "archived"}
+                and new_status not in {"done", "archived"}
+            )
+
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, "
+                "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
+                "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
+                "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
+                "WHERE id = ?",
+                (new_status, new_status, new_status, new_status, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+
+            run_id = None
+            if was_running and new_status != "running" and prev["current_run_id"]:
+                run_id = _kanban_db._end_run(
+                    conn, task_id,
+                    outcome="reclaimed", status="reclaimed",
+                    summary=f"status changed to {new_status} (api/direct)",
+                )
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, ?, 'status', ?, ?)",
+                (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
+            )
+            if reopening_satisfied_parent:
+                for row in conn.execute(
+                    "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                    (task_id,),
+                ).fetchall():
+                    child_id = row["child_id"]
+                    demoted = conn.execute(
+                        "UPDATE tasks SET status = 'todo' "
+                        "WHERE id = ? AND status = 'ready'",
+                        (child_id,),
+                    )
+                    if demoted.rowcount == 1:
+                        conn.execute(
+                            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                            "VALUES (?, 'status', ?, ?)",
+                            (
+                                child_id,
+                                json.dumps(
+                                    {
+                                        "status": "todo",
+                                        "reason": "parent_reopened",
+                                        "parent": task_id,
+                                    }
+                                ),
+                                int(time.time()),
+                            ),
+                        )
+        if new_status in {"done", "ready"}:
+            _kanban_db.recompute_ready(conn)
+        return True
+
+    async def _handle_kanban_boards(self, request: "web.Request") -> "web.Response":
+        """GET /api/kanban/boards — list all boards."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not KANBAN_AVAILABLE:
+            return web.json_response({"ok": False, "error": "kanban module not available"}, status=501)
+        try:
+            boards = _kanban_db.list_boards(include_archived=False)
+            # Get current board
+            current = None
+            try:
+                current = _kanban_db.current_board_slug()
+            except Exception:
+                pass
+            return web.json_response({"ok": True, "boards": boards, "current": current})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _handle_kanban_board(self, request: "web.Request") -> "web.Response":
+        """GET /api/kanban/board — full board grouped by status column."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not KANBAN_AVAILABLE:
+            return web.json_response({"ok": False, "error": "kanban module not available"}, status=501)
+
+        board = request.query.get("board")
+        include_archived = request.query.get("include_archived", "").lower() in {"true", "1"}
+        tenant = request.query.get("tenant") or None
+
+        loop = asyncio.get_event_loop()
+
+        def _do_board() -> Dict[str, Any]:
+            conn = self._kanban_conn(board=board)
+            try:
+                tasks = _kanban_db.list_tasks(
+                    conn,
+                    tenant=tenant,
+                    include_archived=include_archived,
+                )
+                # Pre-fetch link counts per task
+                link_counts: Dict[str, Dict[str, int]] = {}
+                for row in conn.execute("SELECT parent_id, child_id FROM task_links").fetchall():
+                    link_counts.setdefault(row["parent_id"], {"parents": 0, "children": 0})["children"] += 1
+                    link_counts.setdefault(row["child_id"], {"parents": 0, "children": 0})["parents"] += 1
+
+                # Comment counts
+                comment_counts: Dict[str, int] = {
+                    r["task_id"]: r["n"]
+                    for r in conn.execute(
+                        "SELECT task_id, COUNT(*) AS n FROM task_comments GROUP BY task_id"
+                    )
+                }
+
+                # Progress rollup: for each parent, how many children done / total.
+                progress: Dict[str, Dict[str, int]] = {}
+                for row in conn.execute(
+                    "SELECT l.parent_id AS pid, t.status AS cstatus "
+                    "FROM task_links l JOIN tasks t ON t.id = l.child_id"
+                ).fetchall():
+                    p = progress.setdefault(row["pid"], {"done": 0, "total": 0})
+                    p["total"] += 1
+                    if row["cstatus"] == "done":
+                        p["done"] += 1
+
+                latest_event_id = conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
+                ).fetchone()["m"]
+
+                columns: Dict[str, List[dict]] = {c: [] for c in _KANBAN_BOARD_COLUMNS}
+                if include_archived:
+                    columns["archived"] = []
+
+                # Batch-fetch latest summaries
+                summary_map = _kanban_db.latest_summaries(conn, [t.id for t in tasks])
+
+                for t in tasks:
+                    full = summary_map.get(t.id)
+                    preview = (
+                        full[:_KANBAN_CARD_SUMMARY_PREVIEW_CHARS] if full else None
+                    )
+                    d = self._kanban_task_dict(t, latest_summary=preview)
+                    d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
+                    d["comment_count"] = comment_counts.get(t.id, 0)
+                    d["progress"] = progress.get(t.id)
+                    col = t.status if t.status in columns else "todo"
+                    columns[col].append(d)
+
+                return {
+                    "columns": [
+                        {"name": name, "tasks": columns[name]} for name in columns.keys()
+                    ],
+                    "latest_event_id": int(latest_event_id),
+                    "now": int(time.time()),
+                }
+            finally:
+                conn.close()
+
+        try:
+            result = await loop.run_in_executor(None, _do_board)
+            result["ok"] = True
+            return web.json_response(result)
+        except Exception as e:
+            logger.error("[api_server] kanban board error: %s", e, exc_info=True)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _handle_kanban_get_task(self, request: "web.Request") -> "web.Response":
+        """GET /api/kanban/tasks/{task_id} — task detail with comments, events, runs, links."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not KANBAN_AVAILABLE:
+            return web.json_response({"ok": False, "error": "kanban module not available"}, status=501)
+
+        task_id = request.match_info["task_id"]
+        board = request.query.get("board")
+
+        loop = asyncio.get_event_loop()
+
+        def _do_get_task() -> Dict[str, Any]:
+            conn = self._kanban_conn(board=board)
+            try:
+                task = _kanban_db.get_task(conn, task_id)
+                if task is None:
+                    return {"ok": False, "error": f"task {task_id} not found", "_status": 404}
+                full_summary = _kanban_db.latest_summary(conn, task_id)
+                task_d = self._kanban_task_dict(task, latest_summary=full_summary)
+                return {
+                    "ok": True,
+                    "task": task_d,
+                    "comments": [self._kanban_comment_dict(c) for c in _kanban_db.list_comments(conn, task_id)],
+                    "events": [self._kanban_event_dict(e) for e in _kanban_db.list_events(conn, task_id)],
+                    "links": self._kanban_links_for(conn, task_id),
+                    "runs": [self._kanban_run_dict(r) for r in _kanban_db.list_runs(conn, task_id)],
+                }
+            finally:
+                conn.close()
+
+        try:
+            result = await loop.run_in_executor(None, _do_get_task)
+            status = result.pop("_status", 200) if not result.get("ok") else 200
+            return web.json_response(result, status=status)
+        except Exception as e:
+            logger.error("[api_server] kanban get task error: %s", e, exc_info=True)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _handle_kanban_update_task(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/kanban/tasks/{task_id} — update task status/assignee/priority/title/body."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not KANBAN_AVAILABLE:
+            return web.json_response({"ok": False, "error": "kanban module not available"}, status=501)
+
+        task_id = request.match_info["task_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid JSON body"}, status=400)
+
+        board = body.get("board") or request.query.get("board")
+        new_status = body.get("status")
+        new_assignee = body.get("assignee")
+        new_priority = body.get("priority")
+        new_title = body.get("title")
+        new_body = body.get("body")
+        new_result = body.get("result")
+        block_reason = body.get("block_reason")
+        summary = body.get("summary")
+        metadata = body.get("metadata")
+
+        loop = asyncio.get_event_loop()
+
+        def _do_update() -> Dict[str, Any]:
+            conn = self._kanban_conn(board=board)
+            try:
+                task = _kanban_db.get_task(conn, task_id)
+                if task is None:
+                    return {"ok": False, "error": f"task {task_id} not found", "_status": 404}
+
+                # --- assignee ---
+                if new_assignee is not None:
+                    try:
+                        ok = _kanban_db.assign_task(conn, task_id, new_assignee or None)
+                    except RuntimeError as e:
+                        return {"ok": False, "error": str(e), "_status": 409}
+                    if not ok:
+                        return {"ok": False, "error": "task not found", "_status": 404}
+
+                # --- status ---
+                if new_status is not None:
+                    s = new_status
+                    ok = True
+                    if s == "done":
+                        ok = _kanban_db.complete_task(
+                            conn, task_id,
+                            result=new_result,
+                            summary=summary,
+                            metadata=metadata,
+                        )
+                    elif s == "blocked":
+                        ok = _kanban_db.block_task(conn, task_id, reason=block_reason)
+                    elif s == "scheduled":
+                        ok = _kanban_db.schedule_task(conn, task_id, reason=block_reason)
+                    elif s == "ready":
+                        current = _kanban_db.get_task(conn, task_id)
+                        if current and current.status in ("blocked", "scheduled"):
+                            ok = _kanban_db.unblock_task(conn, task_id)
+                        else:
+                            ok = self._kanban_set_status_direct(conn, task_id, "ready")
+                    elif s == "archived":
+                        ok = _kanban_db.archive_task(conn, task_id)
+                    elif s == "running":
+                        return {"ok": False, "error": "Cannot set status to 'running' directly; use the dispatcher/claim path", "_status": 400}
+                    elif s in ("todo", "triage"):
+                        ok = self._kanban_set_status_direct(conn, task_id, s)
+                    else:
+                        return {"ok": False, "error": f"unknown status: {s}", "_status": 400}
+
+                    if not ok:
+                        if s == "ready":
+                            blockers = self._kanban_parents_blocking_ready(conn, task_id)
+                            if blockers:
+                                names = ", ".join(
+                                    f"{p['title']!r} ({p['id']}, status={p['status']})"
+                                    for p in blockers
+                                )
+                                return {
+                                    "ok": False,
+                                    "error": f"Cannot move to 'ready': blocked by parent(s) not done — {names}",
+                                    "_status": 409,
+                                }
+                        return {
+                            "ok": False,
+                            "error": f"status transition to {s!r} not valid from current state",
+                            "_status": 409,
+                        }
+
+                # --- priority ---
+                if new_priority is not None:
+                    with _kanban_db.write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET priority = ? WHERE id = ?",
+                            (int(new_priority), task_id),
+                        )
+                        conn.execute(
+                            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                            "VALUES (?, 'reprioritized', ?, ?)",
+                            (task_id, json.dumps({"priority": int(new_priority)}), int(time.time())),
+                        )
+
+                # --- title / body ---
+                if new_title is not None or new_body is not None:
+                    with _kanban_db.write_txn(conn):
+                        sets: List[str] = []
+                        vals: List[Any] = []
+                        if new_title is not None:
+                            if not str(new_title).strip():
+                                return {"ok": False, "error": "title cannot be empty", "_status": 400}
+                            sets.append("title = ?")
+                            vals.append(str(new_title).strip())
+                        if new_body is not None:
+                            sets.append("body = ?")
+                            vals.append(new_body)
+                        vals.append(task_id)
+                        conn.execute(
+                            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
+                        )
+                        conn.execute(
+                            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                            "VALUES (?, 'edited', NULL, ?)",
+                            (task_id, int(time.time())),
+                        )
+
+                updated = _kanban_db.get_task(conn, task_id)
+                return {"ok": True, "task": self._kanban_task_dict(updated) if updated else None}
+            finally:
+                conn.close()
+
+        try:
+            result = await loop.run_in_executor(None, _do_update)
+            status = result.pop("_status", 200) if not result.get("ok") else 200
+            return web.json_response(result, status=status)
+        except Exception as e:
+            logger.error("[api_server] kanban update task error: %s", e, exc_info=True)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _handle_kanban_create_task(self, request: "web.Request") -> "web.Response":
+        """POST /api/kanban/tasks — create a new task."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not KANBAN_AVAILABLE:
+            return web.json_response({"ok": False, "error": "kanban module not available"}, status=501)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid JSON body"}, status=400)
+
+        title = (body.get("title") or "").strip()
+        if not title:
+            return web.json_response({"ok": False, "error": "title is required"}, status=400)
+
+        board = body.get("board") or request.query.get("board")
+
+        loop = asyncio.get_event_loop()
+
+        def _do_create() -> Dict[str, Any]:
+            conn = self._kanban_conn(board=board)
+            try:
+                task_id = _kanban_db.create_task(
+                    conn,
+                    title=title,
+                    body=body.get("body"),
+                    assignee=body.get("assignee"),
+                    created_by="api_server",
+                    workspace_kind=body.get("workspace_kind", "scratch"),
+                    workspace_path=body.get("workspace_path"),
+                    tenant=body.get("tenant"),
+                    priority=body.get("priority", 0),
+                    parents=body.get("parents", []),
+                    triage=body.get("triage", False),
+                    idempotency_key=body.get("idempotency_key"),
+                    max_runtime_seconds=body.get("max_runtime_seconds"),
+                    skills=body.get("skills"),
+                )
+                task = _kanban_db.get_task(conn, task_id)
+                return {"ok": True, "task": self._kanban_task_dict(task) if task else None}
+            except ValueError as e:
+                return {"ok": False, "error": str(e), "_status": 400}
+            finally:
+                conn.close()
+
+        try:
+            result = await loop.run_in_executor(None, _do_create)
+            status = result.pop("_status", 200) if not result.get("ok") else 200
+            return web.json_response(result, status=status)
+        except Exception as e:
+            logger.error("[api_server] kanban create task error: %s", e, exc_info=True)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _handle_kanban_add_comment(self, request: "web.Request") -> "web.Response":
+        """POST /api/kanban/tasks/{task_id}/comments — add a comment."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not KANBAN_AVAILABLE:
+            return web.json_response({"ok": False, "error": "kanban module not available"}, status=501)
+
+        task_id = request.match_info["task_id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid JSON body"}, status=400)
+
+        comment_body = (body.get("body") or "").strip()
+        if not comment_body:
+            return web.json_response({"ok": False, "error": "body is required"}, status=400)
+
+        author = body.get("author") or "api_server"
+        board = body.get("board") or request.query.get("board")
+
+        loop = asyncio.get_event_loop()
+
+        def _do_comment() -> Dict[str, Any]:
+            conn = self._kanban_conn(board=board)
+            try:
+                if _kanban_db.get_task(conn, task_id) is None:
+                    return {"ok": False, "error": f"task {task_id} not found", "_status": 404}
+                _kanban_db.add_comment(conn, task_id, author=author, body=comment_body)
+                return {"ok": True}
+            finally:
+                conn.close()
+
+        try:
+            result = await loop.run_in_executor(None, _do_comment)
+            status = result.pop("_status", 200) if not result.get("ok") else 200
+            return web.json_response(result, status=status)
+        except Exception as e:
+            logger.error("[api_server] kanban add comment error: %s", e, exc_info=True)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _handle_kanban_dispatch(self, request: "web.Request") -> "web.Response":
+        """POST /api/kanban/dispatch — trigger one dispatcher tick."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if not KANBAN_AVAILABLE:
+            return web.json_response({"ok": False, "error": "kanban module not available"}, status=501)
+
+        try:
+            body = await request.json() if request.body_exists else {}
+        except Exception:
+            body = {}
+
+        board = body.get("board") or request.query.get("board")
+        dry_run = body.get("dry_run", False)
+
+        loop = asyncio.get_event_loop()
+
+        def _do_dispatch() -> Dict[str, Any]:
+            conn = self._kanban_conn(board=board)
+            try:
+                result = _kanban_db.dispatch_once(
+                    conn,
+                    dry_run=bool(dry_run),
+                    board=board,
+                )
+                # Convert DispatchResult to a JSON-serialisable dict
+                return {
+                    "ok": True,
+                    "dispatch": {
+                        "reclaimed": result.reclaimed,
+                        "promoted": result.promoted,
+                        "spawned": list(result.spawned),
+                        "skipped_unassigned": list(result.skipped_unassigned),
+                        "crashed": list(result.crashed),
+                        "auto_blocked": list(result.auto_blocked),
+                        "timed_out": list(result.timed_out),
+                        "stale": list(result.stale),
+                    },
+                }
+            finally:
+                conn.close()
+
+        try:
+            result = await loop.run_in_executor(None, _do_dispatch)
+            return web.json_response(result)
+        except Exception as e:
+            logger.error("[api_server] kanban dispatch error: %s", e, exc_info=True)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
 
@@ -4535,6 +5274,40 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Kanban board API
+            self._app.router.add_get("/api/kanban/boards", self._handle_kanban_boards)
+            self._app.router.add_get("/api/kanban/board", self._handle_kanban_board)
+            self._app.router.add_get("/api/kanban/tasks/{task_id}", self._handle_kanban_get_task)
+            self._app.router.add_patch("/api/kanban/tasks/{task_id}", self._handle_kanban_update_task)
+            self._app.router.add_post("/api/kanban/tasks", self._handle_kanban_create_task)
+            self._app.router.add_post("/api/kanban/tasks/{task_id}/comments", self._handle_kanban_add_comment)
+            self._app.router.add_post("/api/kanban/dispatch", self._handle_kanban_dispatch)
+
+            # Session management API (standalone mixin)
+            try:
+                from gateway.platforms.api_server_sessions import register_session_routes
+                register_session_routes(self)
+            except Exception as _e:
+                logger.debug("Session API routes not loaded: %s", _e)
+            # Context info API (standalone mixin)
+            try:
+                from gateway.platforms.api_server_context import register_context_routes
+                register_context_routes(self)
+            except Exception as _e:
+                logger.debug("Context API routes not loaded: %s", _e)
+            # Memory API (standalone mixin)
+            try:
+                from gateway.platforms.api_server_memory import register_memory_routes
+                register_memory_routes(self)
+            except Exception as _e:
+                logger.debug("Memory API routes not loaded: %s", _e)
+            # Skills API (standalone mixin)
+            try:
+                from gateway.platforms.api_server_skills import register_skills_routes
+                register_skills_routes(self)
+            except Exception as _e:
+                logger.debug("Skills API routes not loaded: %s", _e)
+
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

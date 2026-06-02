@@ -3087,6 +3087,76 @@ class SessionDB:
             messages.append(msg)
         return messages
 
+    def delete_message_round(self, session_id: str, message_id: int) -> List[int]:
+        """Delete an entire conversation round containing the given message.
+
+        A "round" is all messages from the nearest preceding ``user`` message
+        (inclusive) up to but not including the next ``user`` message.  This
+        ensures the LLM never sees a broken user/assistant/tool sequence.
+
+        Returns the list of deleted message IDs (for UI feedback).
+        """
+        with self._lock:
+            # Load all message IDs and roles for this session in order
+            rows = self._conn.execute(
+                "SELECT id, role FROM messages "
+                "WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+
+        if not rows:
+            return []
+
+        # Find the position of the target message
+        target_idx = None
+        for i, row in enumerate(rows):
+            if row["id"] == message_id:
+                target_idx = i
+                break
+        if target_idx is None:
+            return []
+
+        # Walk backwards to find the start of this round (nearest preceding user message)
+        round_start = target_idx
+        for i in range(target_idx, -1, -1):
+            if rows[i]["role"] == "user":
+                round_start = i
+                break
+
+        # Walk forwards to find the end of this round (just before next user message)
+        round_end = target_idx
+        for i in range(round_start + 1, len(rows)):
+            if rows[i]["role"] == "user":
+                round_end = i - 1
+                break
+        else:
+            round_end = len(rows) - 1
+
+        # Collect all message IDs in this round
+        ids_to_delete = [rows[i]["id"] for i in range(round_start, round_end + 1)]
+
+        if not ids_to_delete:
+            return []
+
+        # Batch delete + update session message count
+        with self._lock:
+            placeholders = ",".join("?" for _ in ids_to_delete)
+            self._conn.execute(
+                f"DELETE FROM messages WHERE id IN ({placeholders})",
+                tuple(ids_to_delete),
+            )
+            # Update message count
+            new_count = self._conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+            ).fetchone()[0]
+            self._conn.execute(
+                "UPDATE sessions SET message_count = ? WHERE id = ?",
+                (new_count, session_id),
+            )
+            self._conn.commit()
+
+        return ids_to_delete
+
     def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
         if not session_id:
             return [session_id]
@@ -3913,10 +3983,92 @@ class SessionDB:
         except OSError:
             pass
 
+    def fork_session(
+        self,
+        parent_session_id: str,
+        new_session_id: str,
+        source: str = "webui",
+    ) -> Optional[str]:
+        """Fork a session: create a new session that copies the parent's messages.
+
+        The new session gets the same message history as the parent at the time
+        of forking, with ``parent_session_id`` set to the original session.
+        Returns the new session ID, or None if the parent doesn't exist.
+        """
+        with self._lock:
+            parent = self._conn.execute(
+                "SELECT id, model, model_config, system_prompt, user_id FROM sessions WHERE id = ?",
+                (parent_session_id,),
+            ).fetchone()
+            if not parent:
+                return None
+
+            # Temporarily disable FK checks for the bulk copy operation.
+            self._conn.execute("PRAGMA foreign_keys=OFF")
+
+            try:
+                # Copy parent title with 🔀 prefix
+                parent_title = ""
+                pt = self._conn.execute(
+                    "SELECT title FROM sessions WHERE id = ?",
+                    (parent_session_id,),
+                ).fetchone()
+                if pt and pt["title"]:
+                    parent_title = pt["title"]
+
+                fork_title = "🔀 " + parent_title if parent_title else ""
+
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
+                       system_prompt, parent_session_id, title, started_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        new_session_id,
+                        source,
+                        parent["user_id"],
+                        parent["model"],
+                        parent["model_config"],
+                        parent["system_prompt"],
+                        parent_session_id,
+                        fork_title,
+                        time.time(),
+                    ),
+                )
+
+                # Copy all messages from parent to new session
+                cursor = self._conn.execute(
+                    """INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, tool_name,
+                       reasoning_content, reasoning_details, codex_reasoning_items, codex_message_items, timestamp,
+                       token_count, finish_reason, reasoning)
+                       SELECT ?, role, content, tool_calls, tool_call_id, tool_name,
+                       reasoning_content, reasoning_details, codex_reasoning_items, codex_message_items, timestamp,
+                       token_count, finish_reason, reasoning
+                       FROM messages WHERE session_id = ? ORDER BY id""",
+                    (new_session_id, parent_session_id),
+                )
+                rows_copied = cursor.rowcount
+                logger.info("fork_session: copied %d messages from %s to %s", rows_copied, parent_session_id, new_session_id)
+
+                # Update message_count for new session
+                count = self._conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                    (new_session_id,),
+                ).fetchone()[0]
+                self._conn.execute(
+                    "UPDATE sessions SET message_count = ? WHERE id = ?",
+                    (count, new_session_id),
+                )
+            finally:
+                # Re-enable FK checks
+                self._conn.execute("PRAGMA foreign_keys=ON")
+
+        return new_session_id
+
     def delete_session(
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        cascade: bool = False,
     ) -> bool:
         """Delete a session and all its messages.
 

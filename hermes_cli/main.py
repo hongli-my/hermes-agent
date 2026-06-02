@@ -1764,7 +1764,7 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
         # packages/hermes-ink/dist/entry-exports.js. If that dist bundle is
         # stale after a pull, newer hooks/components can exist in src while
         # being missing at runtime (e.g. useCursorAdvance). Prebuild it here.
-        npm = _node_bin("npm")
+        # (Skip for ui-opentui which has no hermes-ink package.)
         ink_dir = tui_dir / "packages" / "hermes-ink"
         result = subprocess.run(
             [npm, "run", "build"],
@@ -1782,14 +1782,53 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 print(preview)
             sys.exit(1)
 
+        if ink_dir.is_dir():
+            npm = _node_bin("npm")
+            result = subprocess.run(
+                [npm, "run", "build"],
+                cwd=str(ink_dir),
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
+                preview = "\n".join(combined.splitlines()[-30:])
+                print("TUI dev prebuild failed.")
+                if preview:
+                    print(preview)
+                sys.exit(1)
+
+        # Prefer bun for OpenTUI (needs bun:ffi), fallback to tsx
+        bun = shutil.which("bun")
+        if bun:
+            return [bun, "run", str(tui_dir / "src" / "entry.tsx")], tui_dir
         tsx = tui_dir / "node_modules" / ".bin" / "tsx"
+        node_bin = _node_bin("node")
         if tsx.exists():
-            return [str(tsx), "src/entry.tsx"], tui_dir
+            return [node_bin, "--import", "tsx/esm", str(tui_dir / "src" / "entry.tsx")], tui_dir
+        npm = _node_bin("npm")
         return [npm, "start"], tui_dir
 
     # Desktop/dev launches retain the historical "always rebuild" behaviour.
     # Termux cold starts use the freshness check because esbuild startup is
     # expensive on old mobile CPUs.
+    # For TUIs without a dist/entry.js (e.g. ui-opentui with native binaries),
+    # skip the build step and launch via bun directly (OpenTUI requires bun
+    # for its native FFI — node:ffi is not available in standard Node.js).
+    has_dist_entry = (tui_dir / "dist" / "entry.js").is_file()
+    if not has_dist_entry:
+        # Prefer bun (OpenTUI's FFI requires bun:ffi)
+        bun = shutil.which("bun")
+        if bun:
+            return [bun, "run", str(tui_dir / "src" / "entry.tsx")], tui_dir
+        # Fallback: node --import tsx/esm (will fail if OpenTUI FFI is needed)
+        tsx = tui_dir / "node_modules" / ".bin" / "tsx"
+        node = _node_bin("node")
+        if tsx.exists():
+            return [node, "--import", "tsx/esm", str(tui_dir / "src" / "entry.tsx")], tui_dir
+        npm = _node_bin("npm")
+        return [npm, "start"], tui_dir
+
     should_build = True
     if termux_startup:
         should_build = did_install or termux_need_rebuild
@@ -1910,6 +1949,29 @@ def _resolve_tui_heap_mb(default_mb: int = 8192) -> int:
     # graceful V8 exit than a silent cgroup kill).
     return max(1536, sized) if limit_mb > 2048 else sized
 
+def _launch_textual_tui(
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+):
+    """Launch the Textual (Python Rich) TUI."""
+    # Pass model/provider via env vars so _build_agent() picks them up
+    if model:
+        os.environ["HERMES_MODEL"] = model
+    if provider:
+        os.environ["HERMES_PROVIDER"] = provider
+
+    tui_path = os.path.join(os.path.dirname(__file__), "..", "ui-textual", "hermes_tui.py")
+    tui_path = os.path.abspath(tui_path)
+    if not os.path.isfile(tui_path):
+        print(f"Textual TUI not found at {tui_path}")
+        print("Install it: pip install textual")
+        sys.exit(1)
+
+    os.execv(
+        sys.executable,
+        [sys.executable, tui_path],
+    )
+
 
 def _launch_tui(
     resume_session_id: Optional[str] = None,
@@ -1927,9 +1989,10 @@ def _launch_tui(
     pass_session_id: bool = False,
     max_turns: Optional[int] = None,
     accept_hooks: bool = False,
+    tui_dir_override: Optional[str] = None,
 ):
     """Replace current process with the TUI."""
-    tui_dir = PROJECT_ROOT / "ui-tui"
+    tui_dir = PROJECT_ROOT / (tui_dir_override or "ui-tui")
 
     import tempfile
 
@@ -2145,6 +2208,7 @@ def _resolve_use_tui(args) -> bool:
 def cmd_chat(args):
     """Run interactive chat CLI."""
     use_tui = _resolve_use_tui(args)
+    use_textual_tui = getattr(args, "textual_tui", False) or os.environ.get("HERMES_TEXTUAL_TUI") == "1"
 
     # Resolve --continue into --resume with the latest session or by name
     continue_val = getattr(args, "continue_last", None)
@@ -2288,7 +2352,16 @@ def cmd_chat(args):
 
     _pin_kanban_board_env()
 
-    if use_tui:
+    if use_textual_tui:
+        # Pass resume session ID via env var so the TUI process can pick it up.
+        resume_id = getattr(args, "resume", None)
+        if resume_id:
+            os.environ["HERMES_RESUME_SESSION"] = resume_id
+        _launch_textual_tui(
+            model=getattr(args, "model", None),
+            provider=getattr(args, "provider", None),
+        )
+    elif use_tui:
         _launch_tui(
             getattr(args, "resume", None),
             tui_dev=getattr(args, "tui_dev", False),

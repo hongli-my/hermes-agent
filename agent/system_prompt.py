@@ -305,7 +305,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
-    _env_hints = _r.build_environment_hints()
+    _env_hints = _r.build_environment_hints(working_dir=getattr(agent, 'working_dir', None))
     if _env_hints:
         stable_parts.append(_env_hints)
 

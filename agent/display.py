@@ -289,6 +289,8 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         return None
 
     value = args[key]
+    if value is None:
+        return None
     if isinstance(value, list):
         value = value[0] if value else ""
 

@@ -1606,7 +1606,7 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
-def _resolve_runtime_agent_kwargs() -> dict:
+def _resolve_runtime_agent_kwargs(requested: str = None) -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
     Provider is read from ``config.yaml`` ``model.provider`` (the single
@@ -1627,7 +1627,9 @@ def _resolve_runtime_agent_kwargs() -> dict:
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
     try:
-        runtime = resolve_runtime_provider()
+        if requested:
+            logger.info("Provider override requested: %s", requested)
+        runtime = resolve_runtime_provider(requested=requested)
     except AuthError as auth_exc:
         # Distinguish a transient rate-limit/quota cap (credentials are fine,
         # re-auth cannot help) from a genuine auth failure (expired/revoked
@@ -1664,7 +1666,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         if isinstance(_runtime_mot, int) and _runtime_mot > 0:
             max_tokens = _runtime_mot
 
-    return {
+    result = {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
@@ -1674,6 +1676,12 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "credential_pool": runtime.get("credential_pool"),
         "max_tokens": max_tokens,
     }
+    # Propagate the model name from the resolved runtime (e.g. custom_providers[].model)
+    # so that switching provider also switches the model sent to the API endpoint.
+    runtime_model = runtime.get("model")
+    if runtime_model:
+        result["model"] = runtime_model
+    return result
 
 
 def _try_resolve_fallback_provider() -> dict | None:
@@ -7063,7 +7071,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not check_api_server_requirements():
                 logger.warning("API Server: aiohttp not installed")
                 return None
-            return APIServerAdapter(config)
+            adapter = APIServerAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements

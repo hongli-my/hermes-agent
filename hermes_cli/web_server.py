@@ -7351,7 +7351,7 @@ async def get_session_messages(session_id: str, profile: Optional[str] = None):
 
 
 @app.delete("/api/sessions/{session_id}")
-async def delete_session_endpoint(session_id: str, profile: Optional[str] = None):
+async def delete_session_endpoint(session_id: str, profile: Optional[str] = None, cascade: bool = False):
     # ``profile`` deletes a session belonging to another (local) profile by
     # opening its state.db directly. Remote profiles never reach here — the
     # desktop routes their DELETE to the remote backend. Omit for current/default.
@@ -7369,7 +7369,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
         sid = db.resolve_session_id(session_id)
         if not sid:
             return {"ok": True, "already_absent": True}
-        db.delete_session(sid)
+        db.delete_session(sid, cascade=cascade)
         return {"ok": True}
     finally:
         db.close()
@@ -7454,6 +7454,23 @@ async def prune_sessions_endpoint(body: SessionPrune):
             sessions_dir=sessions_dir if sessions_dir.exists() else None,
         )
         return {"ok": True, "removed": removed}
+    finally:
+        db.close()
+
+@app.delete("/api/sessions/{session_id}/messages/{message_id}")
+async def delete_message_round_endpoint(session_id: str, message_id: int):
+    """Delete an entire conversation round containing the given message.
+
+    A round spans from the nearest preceding user message (inclusive) up to
+    (but not including) the next user message.  Returns the deleted IDs.
+    """
+    from hermes_state import SessionDB
+    db = SessionDB()
+    try:
+        deleted_ids = db.delete_message_round(session_id, message_id)
+        if not deleted_ids:
+            raise HTTPException(status_code=404, detail="Message not found")
+        return {"ok": True, "deleted_ids": deleted_ids, "count": len(deleted_ids)}
     finally:
         db.close()
 
