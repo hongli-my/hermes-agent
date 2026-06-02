@@ -2548,13 +2548,33 @@ async def get_session_messages(session_id: str):
 
 
 @app.delete("/api/sessions/{session_id}")
-async def delete_session_endpoint(session_id: str):
+async def delete_session_endpoint(session_id: str, cascade: bool = False):
+    import sys
+    print(f"[DEBUG-DELETE] session_id={session_id} cascade={cascade}", file=sys.stderr, flush=True)
     from hermes_state import SessionDB
     db = SessionDB()
     try:
-        if not db.delete_session(session_id):
+        if not db.delete_session(session_id, cascade=cascade):
             raise HTTPException(status_code=404, detail="Session not found")
         return {"ok": True}
+    finally:
+        db.close()
+
+
+@app.delete("/api/sessions/{session_id}/messages/{message_id}")
+async def delete_message_round_endpoint(session_id: str, message_id: int):
+    """Delete an entire conversation round containing the given message.
+
+    A round spans from the nearest preceding user message (inclusive) up to
+    (but not including) the next user message.  Returns the deleted IDs.
+    """
+    from hermes_state import SessionDB
+    db = SessionDB()
+    try:
+        deleted_ids = db.delete_message_round(session_id, message_id)
+        if not deleted_ids:
+            raise HTTPException(status_code=404, detail="Message not found")
+        return {"ok": True, "deleted_ids": deleted_ids, "count": len(deleted_ids)}
     finally:
         db.close()
 

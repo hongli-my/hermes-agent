@@ -1667,8 +1667,7 @@ class SessionDB:
         """Load all messages for a session, ordered by insertion order."""
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
-                (session_id,),
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY id", (session_id,)
             )
             rows = cursor.fetchall()
         result = []
@@ -2026,6 +2025,76 @@ class SessionDB:
                 continue
             messages.append(msg)
         return messages
+
+    def delete_message_round(self, session_id: str, message_id: int) -> List[int]:
+        """Delete an entire conversation round containing the given message.
+
+        A "round" is all messages from the nearest preceding ``user`` message
+        (inclusive) up to but not including the next ``user`` message.  This
+        ensures the LLM never sees a broken user/assistant/tool sequence.
+
+        Returns the list of deleted message IDs (for UI feedback).
+        """
+        with self._lock:
+            # Load all message IDs and roles for this session in order
+            rows = self._conn.execute(
+                "SELECT id, role FROM messages "
+                "WHERE session_id = ? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+
+        if not rows:
+            return []
+
+        # Find the position of the target message
+        target_idx = None
+        for i, row in enumerate(rows):
+            if row["id"] == message_id:
+                target_idx = i
+                break
+        if target_idx is None:
+            return []
+
+        # Walk backwards to find the start of this round (nearest preceding user message)
+        round_start = target_idx
+        for i in range(target_idx, -1, -1):
+            if rows[i]["role"] == "user":
+                round_start = i
+                break
+
+        # Walk forwards to find the end of this round (just before next user message)
+        round_end = target_idx
+        for i in range(round_start + 1, len(rows)):
+            if rows[i]["role"] == "user":
+                round_end = i - 1
+                break
+        else:
+            round_end = len(rows) - 1
+
+        # Collect all message IDs in this round
+        ids_to_delete = [rows[i]["id"] for i in range(round_start, round_end + 1)]
+
+        if not ids_to_delete:
+            return []
+
+        # Batch delete + update session message count
+        with self._lock:
+            placeholders = ",".join("?" for _ in ids_to_delete)
+            self._conn.execute(
+                f"DELETE FROM messages WHERE id IN ({placeholders})",
+                tuple(ids_to_delete),
+            )
+            # Update message count
+            new_count = self._conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+            ).fetchone()[0]
+            self._conn.execute(
+                "UPDATE sessions SET message_count = ? WHERE id = ?",
+                (new_count, session_id),
+            )
+            self._conn.commit()
+
+        return ids_to_delete
 
     def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
         if not session_id:
@@ -2576,38 +2645,190 @@ class SessionDB:
         except OSError:
             pass
 
+    def fork_session(
+        self,
+        parent_session_id: str,
+        new_session_id: str,
+        source: str = "webui",
+    ) -> Optional[str]:
+        """Fork a session: create a new session that copies the parent's messages.
+
+        The new session gets the same message history as the parent at the time
+        of forking, with ``parent_session_id`` set to the original session.
+        Returns the new session ID, or None if the parent doesn't exist.
+        """
+        with self._lock:
+            parent = self._conn.execute(
+                "SELECT id, model, model_config, system_prompt, user_id FROM sessions WHERE id = ?",
+                (parent_session_id,),
+            ).fetchone()
+            if not parent:
+                return None
+
+            # Temporarily disable FK checks for the bulk copy operation.
+            self._conn.execute("PRAGMA foreign_keys=OFF")
+
+            try:
+                # Copy parent title with 🔀 prefix
+                parent_title = ""
+                pt = self._conn.execute(
+                    "SELECT title FROM sessions WHERE id = ?",
+                    (parent_session_id,),
+                ).fetchone()
+                if pt and pt["title"]:
+                    parent_title = pt["title"]
+
+                fork_title = "🔀 " + parent_title if parent_title else ""
+
+                self._conn.execute(
+                    """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
+                       system_prompt, parent_session_id, title, started_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        new_session_id,
+                        source,
+                        parent["user_id"],
+                        parent["model"],
+                        parent["model_config"],
+                        parent["system_prompt"],
+                        parent_session_id,
+                        fork_title,
+                        time.time(),
+                    ),
+                )
+
+                # Copy all messages from parent to new session
+                cursor = self._conn.execute(
+                    """INSERT INTO messages (session_id, role, content, tool_calls, tool_call_id, tool_name,
+                       reasoning_content, reasoning_details, codex_reasoning_items, codex_message_items, timestamp,
+                       token_count, finish_reason, reasoning)
+                       SELECT ?, role, content, tool_calls, tool_call_id, tool_name,
+                       reasoning_content, reasoning_details, codex_reasoning_items, codex_message_items, timestamp,
+                       token_count, finish_reason, reasoning
+                       FROM messages WHERE session_id = ? ORDER BY id""",
+                    (new_session_id, parent_session_id),
+                )
+                rows_copied = cursor.rowcount
+                logger.info("fork_session: copied %d messages from %s to %s", rows_copied, parent_session_id, new_session_id)
+
+                # Update message_count for new session
+                count = self._conn.execute(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                    (new_session_id,),
+                ).fetchone()[0]
+                self._conn.execute(
+                    "UPDATE sessions SET message_count = ? WHERE id = ?",
+                    (count, new_session_id),
+                )
+            finally:
+                # Re-enable FK checks
+                self._conn.execute("PRAGMA foreign_keys=ON")
+
+        return new_session_id
+
     def delete_session(
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        cascade: bool = False,
     ) -> bool:
         """Delete a session and all its messages.
 
-        Child sessions are orphaned (parent_session_id set to NULL) rather
-        than cascade-deleted, so they remain accessible independently.
+        When *cascade* is True, all child (and grandchild, etc.) sessions
+        are also deleted recursively — this is the "cascade delete" mode
+        used by the WebUI so that deleting a parent session also removes
+        all its forked branches.
+
+        When *cascade* is False (default), child sessions are orphaned
+        (their ``parent_session_id`` is set to NULL).  If the deleted
+        session was the *last* child of its parent, the parent is also
+        deleted recursively up the chain — this prevents dangling parent
+        sessions with no remaining children.
+
         When *sessions_dir* is provided, also removes on-disk transcript
         files (``.json`` / ``.jsonl`` / ``request_dump_*``) for the deleted
-        session. Returns True if the session was found and deleted.
+        session(s). Returns True if the session was found and deleted.
         """
+        deleted_ids: list[str] = []
+
+        def _collect_descendants(conn, sid):
+            """Recursively collect all descendant session IDs."""
+            ids = [sid]
+            rows = conn.execute(
+                "SELECT id FROM sessions WHERE parent_session_id = ?", (sid,)
+            ).fetchall()
+            for row in rows:
+                ids.extend(_collect_descendants(conn, row["id"]))
+            return ids
+
         def _do(conn):
             cursor = conn.execute(
                 "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
             )
             if cursor.fetchone()[0] == 0:
                 return False
-            # Orphan child sessions so FK constraint is satisfied
-            conn.execute(
-                "UPDATE sessions SET parent_session_id = NULL "
-                "WHERE parent_session_id = ?",
-                (session_id,),
-            )
-            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
+            if cascade:
+                # Cascade mode: collect all descendants and delete them all
+                all_ids = _collect_descendants(conn, session_id)
+                # Break FK references first (parent_session_id → sessions.id)
+                # so deletion order doesn't matter
+                for sid in all_ids:
+                    conn.execute(
+                        "UPDATE sessions SET parent_session_id = NULL "
+                        "WHERE parent_session_id = ?",
+                        (sid,),
+                    )
+                # Now safe to delete all sessions + their messages
+                for sid in all_ids:
+                    conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                    conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+                deleted_ids.extend(all_ids)
+            else:
+                # Get parent of the session being deleted
+                row = conn.execute(
+                    "SELECT parent_session_id FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                parent_id = row["parent_session_id"] if row else None
+
+                # Orphan child sessions
+                conn.execute(
+                    "UPDATE sessions SET parent_session_id = NULL "
+                    "WHERE parent_session_id = ?",
+                    (session_id,),
+                )
+                # Delete the session itself
+                conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+                deleted_ids.append(session_id)
+
+                # Cascade: if parent has no remaining children, delete parent too
+                while parent_id:
+                    siblings = conn.execute(
+                        "SELECT COUNT(*) FROM sessions WHERE parent_session_id = ?",
+                        (parent_id,),
+                    ).fetchone()[0]
+                    if siblings > 0:
+                        break  # Parent still has other children
+                    # No siblings left — delete the parent
+                    grandparent_row = conn.execute(
+                        "SELECT parent_session_id FROM sessions WHERE id = ?",
+                        (parent_id,),
+                    ).fetchone()
+                    grandparent_id = grandparent_row["parent_session_id"] if grandparent_row else None
+
+                    conn.execute("DELETE FROM messages WHERE session_id = ?", (parent_id,))
+                    conn.execute("DELETE FROM sessions WHERE id = ?", (parent_id,))
+                    deleted_ids.append(parent_id)
+                    parent_id = grandparent_id
+
             return True
 
         deleted = self._execute_write(_do)
         if deleted:
-            self._remove_session_files(sessions_dir, session_id)
+            for did in deleted_ids:
+                self._remove_session_files(sessions_dir, did)
         return deleted
 
     def prune_sessions(
