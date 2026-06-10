@@ -1007,7 +1007,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         runtime_kwargs = _resolve_runtime_agent_kwargs(requested=provider)
         reasoning_config = GatewayRunner._load_reasoning_config()
-        model = _resolve_gateway_model()
+        # Use the model from runtime_kwargs (e.g. custom_providers[].model) when
+        # a specific provider was requested; otherwise fall back to config.yaml default.
+        model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))

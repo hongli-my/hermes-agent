@@ -1105,7 +1105,7 @@ def _resolve_runtime_agent_kwargs(requested: str = None) -> dict:
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
-    return {
+    result = {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
@@ -1114,6 +1114,12 @@ def _resolve_runtime_agent_kwargs(requested: str = None) -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
     }
+    # Propagate the model name from the resolved runtime (e.g. custom_providers[].model)
+    # so that switching provider also switches the model sent to the API endpoint.
+    runtime_model = runtime.get("model")
+    if runtime_model:
+        result["model"] = runtime_model
+    return result
 
 
 def _try_resolve_fallback_provider() -> dict | None:
