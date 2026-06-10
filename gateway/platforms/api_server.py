@@ -985,6 +985,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         provider: Optional[str] = None,
+        working_dir: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1007,7 +1008,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         runtime_kwargs = _resolve_runtime_agent_kwargs(requested=provider)
         reasoning_config = GatewayRunner._load_reasoning_config()
-        model = _resolve_gateway_model()
+        # Use the model from runtime_kwargs (e.g. custom_providers[].model) when
+        # a specific provider was requested; otherwise fall back to config.yaml default.
+        model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -1036,6 +1039,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            working_dir=working_dir,
         )
         return agent
 
@@ -1715,6 +1719,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
+        # Per-request working directory (passed to AIAgent)
+        working_dir = body.get("working_dir") or body.get("workdir") or None
+
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -1876,6 +1883,37 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "completed",
                 }))
 
+            # ── Approval: route dangerous-command prompts to SSE ──
+            # Generate a run_id so the web client can call
+            # POST /v1/runs/{run_id}/approval to resolve.
+            _run_id = f"run_{uuid.uuid4().hex}"
+            _approval_session_key = gateway_session_key or session_id or _run_id
+            self._run_approval_sessions[_run_id] = _approval_session_key
+
+            def _on_approval(approval_data):
+                """Called from agent executor thread when a dangerous command
+                is detected.  Wraps the data into an ``approval.request`` SSE
+                event and injects it into the content stream queue so the web
+                client can render interactive approve/deny buttons."""
+                event = dict(approval_data or {})
+                event.update({
+                    "event": "approval.request",
+                    "run_id": _run_id,
+                    "timestamp": time.time(),
+                    "choices": ["once", "session", "always", "deny"],
+                })
+                # Register run status so POST /v1/runs/{run_id}/approval
+                # can find this run.  Without this, _handle_run_approval
+                # returns 404 because _run_statuses has no entry.
+                self._set_run_status(
+                    _run_id,
+                    "waiting_for_approval",
+                    last_event="approval.request",
+                    session_id=session_id,
+                )
+                self._run_streams[_run_id] = _stream_q
+                _stream_q.put(("__approval__", event))
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
@@ -1896,6 +1934,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 provider=requested_provider,
+                working_dir=working_dir,
+                approval_notify_callback=_on_approval,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1916,6 +1956,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 provider=requested_provider,
+                working_dir=working_dir,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2071,13 +2112,27 @@ class APIServerAdapter(BasePlatformAdapter):
                 frontends can display them without storing the markers in
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
+                Tagged tuples ``("__approval__", payload)`` are sent as a
+                custom ``event: approval.request`` SSE event so web clients
+                can render interactive approve/deny buttons.
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__approval__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: approval.request\ndata: {event_data}\n\n".encode()
+                    )
                 else:
+                    # Ensure only strings are sent as delta.content —
+                    # non-string objects (dicts, lists) would render as
+                    # "[object Object]" in the frontend.
+                    if not isinstance(item, str):
+                        logger.warning("Non-string delta in SSE stream: %r (type=%s), skipping", item, type(item).__name__)
+                        return time.monotonic()
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -3665,6 +3720,8 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         provider: Optional[str] = None,
+        working_dir: Optional[str] = None,
+        approval_notify_callback=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3676,6 +3733,10 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        If *approval_notify_callback* is provided, it is registered as a
+        gateway approval notification handler so dangerous-command prompts
+        are routed back to the caller (e.g. the SSE stream for web clients).
         """
         loop = asyncio.get_running_loop()
 
@@ -3689,15 +3750,55 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=tool_complete_callback,
                 gateway_session_key=gateway_session_key,
                 provider=provider,
+                working_dir=working_dir,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
             effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
+
+            approval_session_key = gateway_session_key or session_id or effective_task_id
+
+            # Bind approval/session identity for this API run via contextvars
+            # so concurrent runs do not share process environment state.
+            # Mirrors _run_sync in /v1/runs path (issue: chat/completions
+            # path skipped set_session_vars + set_current_session_key, causing
+            # _is_gateway_approval_context() to return False and all dangerous
+            # commands to be auto-approved without prompting the user).
+            from gateway.session_context import clear_session_vars, set_session_vars
+            from tools.approval import (
+                register_gateway_notify,
+                reset_current_session_key,
+                set_current_session_key,
+                unregister_gateway_notify,
             )
+            approval_token = set_current_session_key(approval_session_key)
+            session_tokens = set_session_vars(
+                platform="api_server",
+                session_key=approval_session_key,
+            )
+            if approval_notify_callback is not None:
+                register_gateway_notify(approval_session_key, approval_notify_callback)
+            try:
+                result = agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                )
+            finally:
+                try:
+                    if approval_notify_callback is not None:
+                        unregister_gateway_notify(approval_session_key)
+                finally:
+                    if approval_token is not None:
+                        try:
+                            reset_current_session_key(approval_token)
+                        except Exception:
+                            pass
+                    if session_tokens:
+                        try:
+                            clear_session_vars(session_tokens)
+                        except Exception:
+                            pass
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

@@ -220,6 +220,20 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--open-tui",
+        action="store_true",
+        default=False,
+        help="Launch the OpenTUI (SolidJS + Zig) instead of the Ink TUI",
+    )
+    _inherited_flag(
+        parser,
+        "--textual-tui",
+        action="store_true",
+        default=False,
+        help="Launch the Textual (Python Rich) TUI instead of the Ink TUI",
+    )
+    _inherited_flag(
+        parser,
         "--dev",
         dest="tui_dev",
         action="store_true",
@@ -368,6 +382,20 @@ def build_top_level_parser():
         action="store_true",
         default=False,
         help="Launch the modern TUI instead of the classic REPL",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--open-tui",
+        action="store_true",
+        default=False,
+        help="Launch the OpenTUI (SolidJS + Zig) instead of the Ink TUI",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--textual-tui",
+        action="store_true",
+        default=False,
+        help="Launch the Textual (Python Rich) TUI instead of the Ink TUI",
     )
     _inherited_flag(
         chat_parser,
