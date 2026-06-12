@@ -1358,16 +1358,27 @@ class Sidebar(Vertical):
     def set_title(self, text: str):
         self.query_one("#sb-title", Static).update(Text(text, style=f"bold {C_TEXT}"))
 
+    @staticmethod
+    def _fmt_num(n: int) -> str:
+        """Format large numbers compactly: 1,234 → 1.2K, 1,234,567 → 1.2M."""
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M"
+        if n >= 10_000:
+            return f"{n / 1_000:.1f}K"
+        return f"{n:,}"
+
     def set_context(self, tokens: int, pct: float | None, cost: float, compressions: int = 0, context_len: int | None = None):
-        rows = [(f"{tokens:,} tokens", C_DIM)]
+        rows = [(f"{self._fmt_num(tokens)} tokens", C_DIM)]
         if context_len:
-            rows.append((f"{context_len:,} ctx", C_DIM))
+            rows.append((f"{self._fmt_num(context_len)} ctx", C_DIM))
         rows.append((f"{compressions} compressions", C_DIM))
         self.query_one("#sb-context", Static).update(self._section("Context", rows))
 
     def set_tasks(self, tasks: list[dict]):
+        w = self.query_one("#sb-tasks", Static)
         if not tasks:
-            self.query_one("#sb-tasks", Static).update("")
+            w.update("")
+            w.remove_class("has-content")
             return
         rows = []
         for t in tasks:
@@ -1384,7 +1395,8 @@ class Sidebar(Vertical):
             if len(content) > 30:
                 content = content[:28] + "…"
             rows.append((f"{icon} {content}", style))
-        self.query_one("#sb-tasks", Static).update(self._section("Tasks", rows))
+        w.update(self._section("Tasks", rows))
+        w.add_class("has-content")
 
     def set_usage(self, tools: list[str], skills: list[str]):
         rows: list[tuple[str, str]] = []
@@ -1442,21 +1454,25 @@ class HermesApp(App):
         padding: 1 2 0 2;
         scrollbar-size: 1 1;
         scrollbar-background: #1b1b19;
-        scrollbar-color: #3a3a36;
+        scrollbar-color: #1b1b19;
+        scrollbar-color-hover: #3a3a36;
+        scrollbar-color-active: #3a3a36;
     }
 
     /* ── Sidebar ── */
     #sidebar {
         width: 32;
         height: 1fr;
-        background: #1b1b19;
-        border-left: solid #3a3a36;
+        background: #1e1e1c;
         padding: 1 2;
+        overflow-x: hidden;
+        overflow-y: hidden;
     }
 
-    #sb-title  { margin: 0 0 1 0; }
+    #sb-title   { margin: 0 0 1 0; }
     #sb-context { margin: 0 0 1 0; }
-    #sb-tasks   { margin: 0 0 1 0; }
+    #sb-tasks   { margin: 0 0 1 0; display: none; }
+    #sb-tasks.has-content { display: block; }
     #sb-usage   { margin: 0 0 1 0; }
     #sb-mcp     { margin: 0 0 1 0; }
     #sb-lsp     { margin: 0 0 1 0; }
