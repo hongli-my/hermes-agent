@@ -31,6 +31,7 @@ import sys
 import time
 import json
 import re
+import difflib
 import threading
 import uuid
 from pathlib import Path
@@ -398,6 +399,43 @@ class UserMessage(Static):
         content.append(text, style=C_TEXT)
         super().__init__(content, **kwargs)
         self.add_class("msg-user")
+
+
+class DiffBlock(Static):
+    """Inline diff display for file modifications — shows +/- lines with color coding."""
+
+    _DIFF_GREEN = "#a9dc76"   # added lines
+    _DIFF_RED = "#ff6187"     # removed lines
+    _DIFF_DIM = "#6b675c"     # hunk header / line numbers
+
+    def __init__(self, file_path: str, diff_text: str, **kwargs):
+        self._file_path = file_path
+        self._diff_text = diff_text
+        super().__init__(self._render_diff(), classes="diff-block", **kwargs)
+
+    def _render_diff(self) -> Text:
+        """Render a unified diff as colored Rich Text."""
+        result = Text()
+        result.append(f"📄 {self._file_path}", style=C_BLUE)
+        result.append("\n")
+
+        for line in self._diff_text.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            if line.startswith("@@"):
+                result.append(line, style=self._DIFF_DIM)
+                result.append("\n")
+            elif line.startswith("+"):
+                result.append(line, style=self._DIFF_GREEN)
+                result.append("\n")
+            elif line.startswith("-"):
+                result.append(line, style=self._DIFF_RED)
+                result.append("\n")
+            elif line.startswith(" "):
+                result.append(line, style=C_DIM)
+                result.append("\n")
+
+        return result
 
 
 class CopyButton(Static):
@@ -1087,6 +1125,58 @@ class ModelPickerScreen(ModalScreen[str]):
 
 # ─── Multiline prompt input ───
 
+class SessionPickerScreen(ModalScreen[str | None]):
+    """Modal to browse and resume recent sessions from SessionDB."""
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", show=False),
+        Binding("q", "close", "Close", show=False),
+    ]
+
+    def __init__(self, current_session_id: str = "", **kwargs):
+        self._current_session_id = current_session_id
+        super().__init__(**kwargs)
+
+    def compose(self) -> ComposeResult:
+        yield Static("📂 Recent Sessions", id="sp-title")
+        yield OptionList(id="sp-list")
+        yield Static("Enter to resume · Esc to close", id="sp-hint")
+
+    def on_mount(self) -> None:
+        self._load_sessions()
+
+    def _load_sessions(self):
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            sessions = db.list_sessions(limit=30)
+        except Exception:
+            sessions = []
+
+        ol = self.query_one("#sp-list", OptionList)
+        for s in sessions:
+            sid = s.get("session_id", "")
+            title = s.get("title", "") or sid[:12]
+            msg_count = s.get("message_count", 0)
+            updated = s.get("updated_at", "")
+            if isinstance(updated, str):
+                updated = updated[:16].replace("T", " ")
+            current = " ◀" if sid == self._current_session_id else ""
+            label = f"{title} ({msg_count} msgs, {updated}){current}"
+            ol.add_option(Option(label, id=sid))
+
+        if not sessions:
+            ol.add_option(Option("(no recent sessions)"))
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected):
+        option = event.option
+        sid = getattr(option, "id", None)
+        self.dismiss(sid)
+
+    def action_close(self):
+        self.dismiss(None)
+
+
 class SlashCompleter(Static):
     """A thin popup below the prompt that shows matching slash commands."""
 
@@ -1168,6 +1258,16 @@ class PromptArea(TextArea):
             super().__init__()
 
     async def _on_key(self, event: events.Key) -> None:
+        # ── Shift+Tab: cycle permission mode (must intercept before TextArea eats it) ──
+        if event.key == "shift+tab":
+            event.stop()
+            event.prevent_default()
+            try:
+                self.app.action_cycle_permission()
+            except Exception:
+                pass
+            return
+
         # Drive slash completer from the parent app.
         app = self.app
         completer = None
@@ -1378,6 +1478,32 @@ class HermesApp(App):
     .msg-assistant.streaming {
         border-left: tall #d75f87;
         padding-left: 1;
+    }
+
+    /* ── Diff block ── */
+    .diff-block {
+        margin: 0 0 1 0;
+        padding: 0 1;
+        width: 100%;
+        background: #1e1e1c;
+        border-left: tall #4a90d9;
+    }
+
+    /* ── Session picker ── */
+    #sp-title {
+        text-align: center;
+        padding: 1;
+        color: #cfcabb;
+        text-style: bold;
+    }
+    #sp-list {
+        height: 16;
+        background: #1b1b19;
+    }
+    #sp-hint {
+        text-align: center;
+        padding: 0 1;
+        color: #6b675c;
     }
 
     /* ── Reasoning / thinking block ── */
@@ -1610,6 +1736,19 @@ class HermesApp(App):
     }
 
     /* ── Status bar ── */
+    #notify-bar {
+        dock: bottom;
+        height: auto;
+        max-height: 3;
+        padding: 0 2;
+        background: #2d2b33;
+        color: #cfcabb;
+        display: none;
+    }
+    #notify-bar.active {
+        display: block;
+    }
+
     #status-bar {
         height: 1;
         background: #1b1b19;
@@ -1625,6 +1764,15 @@ class HermesApp(App):
         Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "clear_chat", "Clear"),
+        Binding("ctrl+n", "new_session", "New session"),
+        Binding("ctrl+o", "open_sessions", "Sessions"),
+        Binding("ctrl+m", "pick_model", "Model"),
+        Binding("ctrl+p", "pick_provider", "Provider"),
+        Binding("ctrl+k", "clear_input", "Clear input"),
+        Binding("ctrl+r", "retry_last", "Retry"),
+        Binding("ctrl+z", "undo_last", "Undo"),
+        Binding("ctrl+e", "compress_context", "Compress"),
+        Binding("shift+tab", "cycle_permission", "Mode"),
         Binding("escape", "interrupt", "Interrupt", show=False),
     ]
 
@@ -1657,7 +1805,6 @@ class HermesApp(App):
         self._turn_tools: list[str] = []
         self._turn_skills: list[str] = []
         self._model_name: str = ""
-        self._mode: str = "Plan"
         self._version: str = ""
         self._context_len: int | None = None
         self._anim_timer = None
@@ -1666,6 +1813,14 @@ class HermesApp(App):
         self._cc_last_sid: str | None = None  # cache for _agent_compressions
         self._cc_last_db: int = 0
         self._tasks: list[dict] = []  # plan tasks from todo tool
+        self._file_snapshots: dict[str, list[str]] = {}  # path → lines before edit (for diff)
+        self._permission_mode: str = "default"  # default | plan | auto
+        self._PERMISSION_MODES = ["default", "plan", "auto"]
+
+    @property
+    def _mode(self) -> str:
+        """Display label derived from permission_mode — always in sync."""
+        return {"default": "Default", "plan": "Plan", "auto": "Auto"}.get(self._permission_mode, "Default")
 
     # ── Compose ──
 
@@ -1677,6 +1832,7 @@ class HermesApp(App):
             yield SlashCompleter(id="slash-completer")
             prompt = PromptArea(id="prompt-input", soft_wrap=True, show_line_numbers=False)
             yield prompt
+        yield Static("", id="notify-bar")
         yield Static("", id="status-bar")
 
     def on_mount(self) -> None:
@@ -1694,7 +1850,9 @@ class HermesApp(App):
             Markdown(
                 "**Welcome to Hermes Agent**\n\n"
                 "Send a message to start chatting.\n\n"
-                "`Enter` Send  ·  `Ctrl+J` or `\\`+`Enter` Newline  ·  `Ctrl+L` Clear  ·  `Ctrl+Q` Quit"
+                "`Enter` Send  ·  `Ctrl+J` Newline  ·  `Ctrl+L` Clear  ·  `Ctrl+N` New\n"
+                "`Ctrl+O` Sessions  ·  `Ctrl+M` Model  ·  `Ctrl+P` Provider  ·  `Shift+Tab` Mode\n"
+                "`Ctrl+R` Retry  ·  `Ctrl+Z` Undo  ·  `Ctrl+E` Compress  ·  `Ctrl+Q` Quit"
             ),
             classes="welcome",
         ))
@@ -2327,18 +2485,32 @@ class HermesApp(App):
 
     def _cmd_help(self) -> bool:
         lines = [
-            "▸ /help              Show this help",
-            "▸ /model [name]      Switch model (no args = show current)",
-            "▸ /provider [name]   Switch provider (custom providers)",
-            "▸ /compress [focus]  Compress conversation context",
-            "▸ /retry             Retry last message",
-            "▸ /undo              Remove last exchange from history",
-            "▸ /reload            Reload .env variables",
-            "▸ /reload-mcp        Reload MCP servers from config",
-            "▸ /reload-skills     Rescan ~/.hermes/skills/",
-            "▸ /yolo [off]        Toggle auto-approve all commands",
-            "▸ /clear             Clear chat and start new session",
-            "▸ /quit              Exit",
+            "▸ Slash commands:",
+            "  /help              Show this help",
+            "  /model [name]      Switch model (no args = picker)",
+            "  /provider [name]   Switch provider (no args = picker)",
+            "  /compress [focus]  Compress conversation context",
+            "  /retry             Retry last message",
+            "  /undo              Remove last exchange from history",
+            "  /reload            Reload .env variables",
+            "  /reload-mcp        Reload MCP servers from config",
+            "  /reload-skills     Rescan ~/.hermes/skills/",
+            "  /yolo [off]        Toggle auto-approve all commands",
+            "  /clear             Clear chat and start new session",
+            "  /quit              Exit",
+            "",
+            "▸ Keyboard shortcuts:",
+            "  Ctrl+M             Switch model",
+            "  Ctrl+P             Switch provider",
+            "  Shift+Tab          Cycle mode (Default→Plan→Auto)",
+            "  Ctrl+N             New session",
+            "  Ctrl+O             Browse recent sessions",
+            "  Ctrl+R             Retry last message",
+            "  Ctrl+Z             Undo last exchange",
+            "  Ctrl+E             Compress context",
+            "  Ctrl+K             Clear input",
+            "  Ctrl+L             Clear chat",
+            "  Ctrl+Q             Quit",
         ]
         self.query_one("#chat-area").mount(
             Static(Group(*[Text(l, style=C_DIM) for l in lines]), classes="system-msg")
@@ -2653,6 +2825,15 @@ class HermesApp(App):
             # UI thread) for approval/sudo prompts to find the callbacks.
             self._register_thread_local_callbacks()
 
+            # ── Plan mode: prepend plan-only instruction ──
+            actual_text = text
+            if getattr(self._agent, "_tui_plan_mode", False):
+                actual_text = (
+                    "[PLAN MODE — do NOT execute any code, edit any file, or run any "
+                    "mutating command. Only analyze, plan, and describe what you would do. "
+                    "Write the plan as a markdown document.]\n\n" + text
+                )
+
             try:
                 # NOTE: Do NOT pass stream_callback to run_conversation().
                 # _fire_stream_delta() fires BOTH stream_delta_callback AND
@@ -2661,7 +2842,7 @@ class HermesApp(App):
                 # in _wire_agent_callbacks(), which is sufficient to enable the
                 # streaming path (_has_stream_consumers() checks it).
                 result = self._agent.run_conversation(
-                    text,
+                    actual_text,
                     conversation_history=list(self._history),
                     task_id=getattr(self._agent, "session_id", None),
                 )
@@ -2789,6 +2970,12 @@ class HermesApp(App):
             self._turn_tools.append(name)
         self._detect_skill_usage(name, args)
 
+        # ── Snapshot files before write_file / patch modifies them (for diff) ──
+        if name in ("write_file", "patch") and isinstance(args, dict):
+            file_path = args.get("path", "")
+            if file_path:
+                self._snapshot_file(file_path)
+
         # Ensure ToolSummaryBlock exists (mounted before the response widget).
         if self._tool_summary is None:
             self._tool_summary = ToolSummaryBlock()
@@ -2836,6 +3023,12 @@ class HermesApp(App):
                 ok=ok,
             )
 
+        # ── Render inline diff for file modification tools ──
+        if ok and str(name) in ("write_file", "patch") and isinstance(args, dict):
+            file_path = args.get("path", "")
+            if file_path:
+                self._render_file_diff(file_path)
+
         # Extract plan tasks from todo tool results.
         if str(name) == "todo":
             self._update_tasks_from_todo(result)
@@ -2850,6 +3043,38 @@ class HermesApp(App):
         self._status_kind = kind
         self._status_text = text
         self._render_status()
+
+        # ── Compression / context events → notify bar above input ──
+        if text and any(kw in text.lower() for kw in ("compact", "compress", "compressi")):
+            self._show_notify(f"🗜️ {text}")
+
+    _NOTIFY_FADE_DELAY = 4.0  # seconds before auto-hide
+    _notify_fade_timer = None
+
+    def _show_notify(self, text: str):
+        """Show a notification in the bar above the input; auto-fades after a few seconds."""
+        try:
+            nb = self.query_one("#notify-bar", Static)
+            nb.update(Text(text, style=C_DIM))
+            nb.add_class("active")
+        except Exception:
+            pass
+        # Reset auto-hide timer
+        if self._notify_fade_timer is not None:
+            self._notify_fade_timer.stop()
+        self._notify_fade_timer = self.set_timer(
+            self._NOTIFY_FADE_DELAY, self._hide_notify
+        )
+
+    def _hide_notify(self):
+        """Hide the notify bar."""
+        try:
+            nb = self.query_one("#notify-bar", Static)
+            nb.remove_class("active")
+            nb.update("")
+        except Exception:
+            pass
+        self._notify_fade_timer = None
 
     def _on_clarify(self, question, choices):
         """Show clarify question in chat history (the modal already handled the answer)."""
@@ -3119,12 +3344,69 @@ class HermesApp(App):
         right = Text()
         right.append(self._fmt_tokens(self._agent_tokens() if self._agent else 0), style=C_DIM)
         right.append("   ", style=C_DIM)
-        right.append("ctrl+q", style=C_TEXT)
-        right.append(" quit", style=C_DIM)
+        right.append("⇧⇥", style=C_TEXT)
+        right.append(" mode", style=C_DIM)
 
         gap = max(bar_w - left.cell_len - right.cell_len, 1)
         line = Text.assemble(left, " " * gap, right)
         bar.update(line)
+
+    def _snapshot_file(self, file_path: str):
+        """Read and cache the current file contents before a tool modifies it."""
+        try:
+            p = Path(file_path)
+            if not p.is_absolute():
+                p = Path(os.getcwd()) / p
+            if p.exists() and p.is_file():
+                self._file_snapshots[str(p)] = p.read_text(errors="replace").splitlines(keepends=True)
+            else:
+                self._file_snapshots[str(p)] = []  # new file
+        except Exception:
+            pass
+
+    def _render_file_diff(self, file_path: str):
+        """Generate and display a unified diff for the modified file."""
+        try:
+            p = Path(file_path)
+            if not p.is_absolute():
+                p = Path(os.getcwd()) / p
+            key = str(p)
+
+            old_lines = self._file_snapshots.pop(key, None)
+            if old_lines is None:
+                return  # no snapshot — nothing to compare
+
+            if p.exists() and p.is_file():
+                new_lines = p.read_text(errors="replace").splitlines(keepends=True)
+            else:
+                new_lines = []  # file was deleted
+
+            # Skip if unchanged
+            if old_lines == new_lines:
+                return
+
+            diff_lines = list(difflib.unified_diff(
+                old_lines, new_lines,
+                fromfile=f"a/{p.name}", tofile=f"b/{p.name}",
+                lineterm="", n=3,
+            ))
+
+            if not diff_lines:
+                return
+
+            # Truncate very long diffs to avoid flooding the chat area
+            max_diff_lines = 80
+            truncated = len(diff_lines) > max_diff_lines + 5
+            display_lines = diff_lines[:max_diff_lines]
+            if truncated:
+                display_lines.append(f"... ({len(diff_lines) - max_diff_lines} more lines)\n")
+
+            diff_text = "".join(display_lines)
+            chat = self.query_one("#chat-area")
+            chat.mount(DiffBlock(str(p), diff_text))
+            self._scroll_to_bottom()
+        except Exception:
+            pass
 
     def _scroll_to_bottom(self):
         self.query_one("#chat-area").scroll_end(animate=False)
@@ -3138,6 +3420,7 @@ class HermesApp(App):
         self._tool_blocks.clear()
         self._tool_summary = None
         self._turn_start_time = 0.0
+        self._file_snapshots.clear()
         msgs = self.query_one("#chat-area")
         msgs.remove_children()
         msgs.mount(Static(
@@ -3145,6 +3428,145 @@ class HermesApp(App):
             classes="welcome",
         ))
         self._render_status()
+
+    def action_new_session(self):
+        """Ctrl+N — start a fresh session (clear + new session ID)."""
+        if self.is_working:
+            self._show_system_msg("Cannot start new session while agent is working.")
+            return
+        self.action_clear_chat()
+        if self._agent:
+            try:
+                from hermes_state import SessionDB
+                session_db = getattr(self._agent, "_session_db", None) or getattr(self._agent, "session_db", None) or SessionDB()
+                new_id = session_db.create_session(source="textual-tui")
+                self._agent.session_id = new_id
+                self._agent._cached_system_prompt = None
+                self._show_system_msg(f"New session: {new_id}")
+            except Exception as e:
+                self._show_system_msg(f"New session failed: {e}")
+
+    def action_retry_last(self):
+        """Ctrl+R — retry last user message."""
+        self._cmd_retry()
+
+    def action_undo_last(self):
+        """Ctrl+Z — undo last exchange."""
+        self._cmd_undo()
+
+    def action_compress_context(self):
+        """Ctrl+E — compress conversation context."""
+        self._cmd_compress("")
+
+    def action_pick_model(self):
+        """Ctrl+M — open model picker."""
+        if self.is_working:
+            self._show_system_msg("Cannot switch model while agent is working.")
+            return
+        def on_pick(result: str | None):
+            if result:
+                self._apply_model_switch(result)
+        self.push_screen(
+            ModelPickerScreen(self._model_name, getattr(self._agent, "provider", "") or ""),
+            on_pick,
+        )
+
+    def action_pick_provider(self):
+        """Ctrl+P — open provider picker."""
+        if self.is_working:
+            self._show_system_msg("Cannot switch provider while agent is working.")
+            return
+        def on_pick(result: str | None):
+            if result:
+                self._apply_model_switch(f"provider:{result}")
+        self.push_screen(
+            ProviderPickerScreen(getattr(self._agent, "provider", "") or ""),
+            on_pick,
+        )
+
+    def action_clear_input(self):
+        """Ctrl+K — clear the input area."""
+        prompt = self.query_one("#prompt-input", PromptArea)
+        prompt.text = ""
+        prompt.cursor_location = (0, 0)
+
+    def action_cycle_permission(self):
+        """Shift+Tab — cycle through permission modes: default → plan → auto → default."""
+        idx = self._PERMISSION_MODES.index(self._permission_mode)
+        self._permission_mode = self._PERMISSION_MODES[(idx + 1) % len(self._PERMISSION_MODES)]
+        mode = self._permission_mode
+        session_key = getattr(self._agent, "session_id", "") or ""
+
+        if mode == "plan":
+            # Disable YOLO so approvals still fire
+            if session_key:
+                try:
+                    from tools.approval import disable_session_yolo
+                    disable_session_yolo(session_key)
+                except Exception:
+                    pass
+            # Set plan mode flag so _run_turn injects plan-only instruction
+            if self._agent:
+                self._agent._tui_plan_mode = True
+            self._show_system_msg("🔒 Plan mode — agent will only plan, not execute")
+        elif mode == "auto":
+            # Enable YOLO for auto mode
+            if session_key:
+                try:
+                    from tools.approval import enable_session_yolo
+                    enable_session_yolo(session_key)
+                except Exception:
+                    pass
+            if self._agent:
+                self._agent._tui_plan_mode = False
+            self._show_system_msg("🔥 Auto mode — all commands auto-approved")
+        else:
+            # Disable YOLO for default mode
+            if session_key:
+                try:
+                    from tools.approval import disable_session_yolo
+                    disable_session_yolo(session_key)
+                except Exception:
+                    pass
+            if self._agent:
+                self._agent._tui_plan_mode = False
+            self._show_system_msg("✋ Default mode — approvals required")
+
+        self._render_status()
+
+    def action_open_sessions(self):
+        """Ctrl+O — open session browser."""
+        self._open_session_picker()
+
+    def _open_session_picker(self):
+        """Show a modal with recent sessions; on selection, resume that session."""
+        if self.is_working:
+            self._show_system_msg("Cannot switch sessions while agent is working.")
+            return
+        current_id = getattr(self._agent, "session_id", "") or ""
+
+        def on_pick(session_id: str | None):
+            if not session_id or session_id == current_id:
+                return
+            self._resume_session(session_id)
+
+        self.push_screen(SessionPickerScreen(current_id), on_pick)
+
+    def _resume_session(self, session_id: str):
+        """Resume a different session by ID — clear chat and reload."""
+        if not self._agent:
+            return
+        try:
+            self.action_clear_chat()
+            self._agent.session_id = session_id
+            self._agent._tui_is_resume = True
+            self._agent._cached_system_prompt = None
+            self._load_resumed_session()
+            self._restore_session_state()
+            self._refresh_sidebar()
+            self._render_status()
+        except Exception as e:
+            self._show_system_msg(f"Failed to resume session: {e}")
 
     def on_resize(self, event) -> None:
         self._render_status(error=False)
