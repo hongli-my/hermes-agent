@@ -181,6 +181,15 @@ def _build_agent():
         or None
     )
 
+    # ── Filesystem checkpoints: config.yaml → checkpoints: {enabled, max_snapshots, …} ──
+    cp_cfg = cfg.get("checkpoints", {})
+    if isinstance(cp_cfg, bool):
+        cp_cfg = {"enabled": cp_cfg}
+    checkpoints_enabled = cp_cfg.get("enabled", False)
+    checkpoint_max_snapshots = cp_cfg.get("max_snapshots", 20)
+    checkpoint_max_total_size_mb = cp_cfg.get("max_total_size_mb", 500)
+    checkpoint_max_file_size_mb = cp_cfg.get("max_file_size_mb", 10)
+
     agent = AIAgent(
         model=runtime.get("model") or model,
         max_iterations=max_turns,
@@ -203,7 +212,10 @@ def _build_agent():
         ephemeral_system_prompt=system_prompt,
         prefill_messages=prefill_messages,
         request_overrides=request_overrides,
-        checkpoints_enabled=False,
+        checkpoints_enabled=checkpoints_enabled,
+        checkpoint_max_snapshots=checkpoint_max_snapshots,
+        checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
+        checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
         pass_session_id=False,
         skip_context_files=False,
         skip_memory=False,
@@ -1177,6 +1189,173 @@ class SessionPickerScreen(ModalScreen[str | None]):
         self.dismiss(None)
 
 
+class InputHistory:
+    """Manages input history with prefix filtering, up/down navigation, and file persistence.
+
+    Design follows prompt_toolkit / bash-style history:
+      - Up/Down browse history filtered by current prefix
+      - When prefix is empty, browse all history
+      - Tab completes the current prefix to the latest matching entry
+      - History is persisted to ~/.hermes/.hermes_history (shared with CLI)
+      - Max 2000 entries, duplicates of the last entry are skipped
+    """
+
+    _MAX_ENTRIES = 2000
+    _HISTORY_FILE = Path.home() / ".hermes" / ".hermes_history"
+
+    def __init__(self):
+        self._entries: list[str] = []
+        self._index: int = -1           # -1 = not browsing (at "live" line)
+        self._saved_line: str = ""      # the line the user was typing before browsing
+        self._load()
+
+    # ── Persistence ──
+
+    def _load(self):
+        """Load history from file.
+
+        Supports two formats:
+          1. prompt_toolkit FileHistory format (used by CLI):
+             Lines starting with ``#`` are timestamps, lines starting
+             with ``+`` are entries (the ``+`` prefix is stripped).
+          2. Plain text: one entry per line (used by our own append).
+        """
+        try:
+            if not self._HISTORY_FILE.exists():
+                return
+            with open(self._HISTORY_FILE, "r", encoding="utf-8", errors="replace") as f:
+                raw_lines = f.read().splitlines()
+        except Exception:
+            self._entries = []
+            return
+
+        entries: list[str] = []
+        for line in raw_lines:
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("+"):
+                # prompt_toolkit FileHistory format: strip leading '+'
+                entry = line[1:]
+            else:
+                entry = line
+            if entry.strip():
+                entries.append(entry)
+        self._entries = entries
+
+    def _save(self):
+        """Persist history to file in prompt_toolkit FileHistory format.
+
+        Format: ``# <timestamp>`` on one line, ``+ <entry>`` on the next.
+        This is the same format used by the CLI's ``FileHistory``, ensuring
+        both interfaces share a single history file seamlessly.
+        """
+        try:
+            self._HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            from datetime import datetime
+            with open(self._HISTORY_FILE, "w", encoding="utf-8") as f:
+                for entry in self._entries[-self._MAX_ENTRIES:]:
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                    f.write(f"# {ts}\n+{entry}\n")
+        except Exception:
+            pass
+
+    # ── Mutation ──
+
+    def append(self, text: str):
+        """Add a new entry. Skip if it's the same as the last one."""
+        text = text.strip()
+        if not text:
+            return
+        if self._entries and self._entries[-1] == text:
+            return
+        self._entries.append(text)
+        if len(self._entries) > self._MAX_ENTRIES:
+            self._entries = self._entries[-self._MAX_ENTRIES:]
+        self._save()
+        self._index = -1  # reset browsing
+
+    # ── Navigation ──
+
+    def _matches(self, prefix: str) -> list[int]:
+        """Return indices of entries matching *prefix* (newest-first order)."""
+        if not prefix:
+            return list(range(len(self._entries) - 1, -1, -1))
+        lp = prefix.lower()
+        return [i for i in range(len(self._entries) - 1, -1, -1)
+                if self._entries[i].lower().startswith(lp)]
+
+    def _prefix_for(self, saved_line: str) -> str:
+        """Derive the search prefix from the saved line.
+
+        - Slash commands (starting with /): match full prefix
+        - Free text: match by first word (lighter filtering — lets you
+          type "fix" and see all "fix ..." entries regardless of trailing words)
+        - Empty: match everything
+        """
+        if not saved_line:
+            return ""
+        if saved_line.startswith("/"):
+            return saved_line
+        first_word = saved_line.split()[0]
+        return first_word
+
+    def up(self, current_text: str) -> str | None:
+        """Move to an older entry. Returns new text or None if at end."""
+        if not self._entries:
+            return None
+        # First press: save current line & start browsing
+        if self._index == -1:
+            self._saved_line = current_text
+            self._index = len(self._entries)  # sentinel: one past the end
+        prefix = self._prefix_for(self._saved_line)
+        filtered = self._matches(prefix)
+        if not filtered:
+            return None
+        # Find the next older match (filtered is newest-first, so the first
+        # entry with index < current index is the next older one).
+        for idx in filtered:
+            if idx < self._index:
+                self._index = idx
+                return self._entries[idx]
+        return None  # no older match
+
+    def down(self) -> str | None:
+        """Move to a newer entry. Returns new text, saved line, or None."""
+        if self._index == -1:
+            return None
+        prefix = self._prefix_for(self._saved_line)
+        filtered = self._matches(prefix)
+        # Find the next newer match (filtered is newest-first; find the
+        # entry with the smallest index that is still > current).
+        newer = [idx for idx in filtered if idx > self._index]
+        if newer:
+            self._index = newer[-1]  # last in newest-first = smallest index > current
+            return self._entries[self._index]
+        # Past the newest match: return saved line
+        self._index = -1
+        return self._saved_line
+
+    def reset(self):
+        """Reset browsing state (e.g. after submit or escape)."""
+        self._index = -1
+        self._saved_line = ""
+
+    @property
+    def browsing(self) -> bool:
+        return self._index != -1
+
+    # ── Tab completion ──
+
+    def complete(self, prefix: str) -> str | None:
+        """Return the most recent entry starting with *prefix*, or None."""
+        if not prefix:
+            return None
+        matches = self._matches(prefix)
+        if matches:
+            return self._entries[matches[0]]
+        return None
+
+
 class SlashCompleter(Static):
     """A thin popup below the prompt that shows matching slash commands."""
 
@@ -1191,6 +1370,7 @@ class SlashCompleter(Static):
         ("/reload-mcp", "Reload MCP servers"),
         ("/reload-skills", "Rescan skills directory"),
         ("/yolo", "Toggle auto-approve all commands"),
+        ("/rollback", "List or restore filesystem checkpoints"),
         ("/clear", "Clear chat and start new session"),
         ("/quit", "Exit"),
     ]
@@ -1241,21 +1421,53 @@ class SlashCompleter(Static):
 
 
 class PromptArea(TextArea):
-    """Multiline input.
+    """Multiline input with smart Enter.
 
-    Submit / newline keys (terminal-dependent):
-      - Enter            → submit
-      - Ctrl+J           → newline (reliable in plain terminals)
-      - Shift/Alt+Enter  → newline (only with enhanced keyboard protocol)
-      - "\\" + Enter      → newline (shell-style continuation, works everywhere)
+    Enter behaviour:
+      - At the end of the last line  → submit
+      - Anywhere else                → insert newline (editing multi-line content)
+      - Ctrl+Enter / Ctrl+J          → force submit from anywhere
+      - "\\" + Enter                  → shell-style continuation (newline, works everywhere)
+
+    This makes multi-line paste work naturally: pasted content can be
+    edited with Enter adding newlines, then submitted by pressing Enter
+    at the very end of the last line.
+
+    Inline suggestion (ghost text):
+      - As you type, the most recent history match appears in dim text
+        after the cursor — press Tab or → to accept.
+      - Slash commands (starting with /) get their own popup completer.
     """
-
-    _NEWLINE_KEYS = {"shift+enter", "ctrl+j", "alt+enter"}
 
     class Submitted(Message):
         def __init__(self, value: str):
             self.value = value
             super().__init__()
+
+    def update_suggestion(self) -> None:
+        """Auto-update the inline ghost-text suggestion from input history.
+
+        Called by Textual after every text change.  We look up the most
+        recent history entry that starts with the current input text and
+        show the *suffix* (the part after what the user already typed)
+        as a dim suggestion.
+        """
+        current = self.text
+        if not current or current.startswith("/"):
+            # Slash commands are handled by SlashCompleter popup, not ghost text.
+            self.suggestion = ""
+            return
+        input_hist = getattr(self.app, "_input_history", None)
+        if not input_hist or input_hist.browsing:
+            # Don't suggest while browsing history (confusing UX).
+            self.suggestion = ""
+            return
+        match = input_hist.complete(current)
+        if match and match != current and match.lower().startswith(current.lower()):
+            # Show only the part the user hasn't typed yet.
+            self.suggestion = match[len(current):]
+        else:
+            self.suggestion = ""
 
     async def _on_key(self, event: events.Key) -> None:
         # ── Shift+Tab: cycle permission mode (must intercept before TextArea eats it) ──
@@ -1304,30 +1516,115 @@ class PromptArea(TextArea):
                 completer.display = False
                 return
 
+        # ── Up/Down: input history (only when completer is hidden) ──
+        if event.key == "up":
+            # In a multiline input, only browse history when cursor is on row 0
+            # (so Up still works for moving within multiline text on lower rows).
+            row, _ = self.cursor_location
+            input_hist = getattr(app, "_input_history", None)
+            if input_hist and row == 0:
+                event.stop()
+                event.prevent_default()
+                result = input_hist.up(self.text)
+                if result is not None:
+                    self.text = result
+                    self.cursor_location = (0, len(self.text))
+                return
+        if event.key == "down":
+            row, _ = self.cursor_location
+            last_row = self.document.line_count - 1
+            input_hist = getattr(app, "_input_history", None)
+            if input_hist and row == last_row and input_hist.browsing:
+                event.stop()
+                event.prevent_default()
+                result = input_hist.down()
+                if result is not None:
+                    self.text = result
+                    self.cursor_location = (0, len(self.text))
+                return
+
+        # ── Tab: accept inline suggestion (ghost text) ──
+        # If there's a visible suggestion, Tab inserts it (TextArea's built-in
+        # Right-arrow behaviour does the same).  We intercept Tab so it feels
+        # natural — most people expect Tab for completion.
+        if event.key == "tab":
+            if self.suggestion:
+                event.stop()
+                event.prevent_default()
+                self.insert(self.suggestion)
+                return
+            # No suggestion: try history completion as fallback
+            input_hist = getattr(app, "_input_history", None)
+            current = self.text
+            if input_hist and current and not current.startswith("/"):
+                completed = input_hist.complete(current)
+                if completed and completed != current:
+                    event.stop()
+                    event.prevent_default()
+                    self.text = completed
+                    self.cursor_location = (0, len(self.text))
+                    return
+
         if event.key == "enter":
             event.stop()
             event.prevent_default()
-            # Shell-style continuation: a trailing backslash before the cursor
-            # turns Enter into a newline instead of a submit.
             row, col = self.cursor_location
+            last_row = self.document.line_count - 1
             try:
                 line = self.document.get_line(row)
             except Exception:
                 line = ""
+
+            # Shell-style continuation: a trailing backslash before the cursor
+            # turns Enter into a newline instead of a submit.
             if col > 0 and col <= len(line) and line[col - 1] == "\\":
                 self.action_delete_left()
                 self.insert("\n")
                 return
-            # Hide completer on submit.
-            if completer:
-                completer.display = False
-            self.post_message(self.Submitted(self.text))
+
+            # ── Smart Enter: submit only when cursor is at the end of the last line ──
+            # This makes multi-line paste work naturally — you can edit the pasted
+            # content (Enter = newline inside it), then press Enter at the very end
+            # to submit.  Ctrl+Enter forces submit from anywhere.
+            #
+            # Special case: when there's only one line of text, Enter always submits
+            # (preserves the "type and hit Enter" muscle memory for quick messages).
+            single_line = (self.document.line_count == 1)
+            at_last_row = (row == last_row)
+            at_line_end = (col >= len(line))
+            if single_line or (at_last_row and at_line_end):
+                # Submit
+                if completer:
+                    completer.display = False
+                input_hist = getattr(app, "_input_history", None)
+                if input_hist:
+                    input_hist.reset()
+                self.suggestion = ""
+                self.post_message(self.Submitted(self.text))
+            else:
+                # Insert newline (not at the end of last line → editing multi-line)
+                self.insert("\n")
             return
-        if event.key in self._NEWLINE_KEYS:
+
+        # ── Ctrl+Enter: force submit from anywhere (even mid-line) ──
+        if event.key == "ctrl+enter" or event.key == "ctrl+j":
             event.stop()
             event.prevent_default()
-            self.insert("\n")
+            if completer:
+                completer.display = False
+            input_hist = getattr(app, "_input_history", None)
+            if input_hist:
+                input_hist.reset()
+            self.suggestion = ""
+            self.post_message(self.Submitted(self.text))
             return
+
+        # Any other key: reset history browsing if user starts typing
+        if event.key not in ("up", "down", "left", "right", "home", "end"):
+            input_hist = getattr(app, "_input_history", None)
+            if input_hist and input_hist.browsing:
+                input_hist.reset()
+
         await super()._on_key(event)
 
         # After any other key, update completer matches.
@@ -1751,6 +2048,10 @@ class HermesApp(App):
         background: #1b1b19;
     }
 
+    #prompt-input .text-area--suggestion {
+        color: #5a574e;  /* dim ghost text — clearly muted vs #cfcabb normal text */
+    }
+
     /* ── Status bar ── */
     #notify-bar {
         dock: bottom;
@@ -1832,6 +2133,7 @@ class HermesApp(App):
         self._file_snapshots: dict[str, list[str]] = {}  # path → lines before edit (for diff)
         self._permission_mode: str = "default"  # default | plan | auto
         self._PERMISSION_MODES = ["default", "plan", "auto"]
+        self._input_history = InputHistory()
 
     @property
     def _mode(self) -> str:
@@ -1866,8 +2168,8 @@ class HermesApp(App):
             Markdown(
                 "**Welcome to Hermes Agent**\n\n"
                 "Send a message to start chatting.\n\n"
-                "`Enter` Send  ·  `Ctrl+J` Newline  ·  `Ctrl+L` Clear  ·  `Ctrl+N` New\n"
-                "`Ctrl+O` Sessions  ·  `Ctrl+M` Model  ·  `Ctrl+P` Provider  ·  `Shift+Tab` Mode\n"
+                "`Enter` Smart(Send/Newline)  ·  `Ctrl+Enter` Force Send  ·  `↑↓` History  ·  `Tab` Complete  ·  `Ctrl+L` Clear\n"
+                "`Ctrl+N` New  ·  `Ctrl+O` Sessions  ·  `Ctrl+M` Model  ·  `Ctrl+P` Provider  ·  `Shift+Tab` Mode\n"
                 "`Ctrl+R` Retry  ·  `Ctrl+Z` Undo  ·  `Ctrl+E` Compress  ·  `Ctrl+Q` Quit"
             ),
             classes="welcome",
@@ -2409,6 +2711,9 @@ class HermesApp(App):
         if not text or self._agent is None:
             return
 
+        # ── Save to input history (shared with CLI) ──
+        self._input_history.append(text)
+
         self.query_one("#prompt-input", PromptArea).text = ""
         msgs = self.query_one("#chat-area")
 
@@ -2488,6 +2793,8 @@ class HermesApp(App):
             return True
         elif canonical == "yolo":
             return self._cmd_yolo(args)
+        elif canonical == "rollback":
+            return self._cmd_rollback(args)
         else:
             # Unknown command — not consumed, send to agent as message.
             return False
@@ -2512,6 +2819,7 @@ class HermesApp(App):
             "  /reload-mcp        Reload MCP servers from config",
             "  /reload-skills     Rescan ~/.hermes/skills/",
             "  /yolo [off]        Toggle auto-approve all commands",
+            "  /rollback [N|diff] List or restore filesystem checkpoints",
             "  /clear             Clear chat and start new session",
             "  /quit              Exit",
             "",
@@ -2831,6 +3139,122 @@ class HermesApp(App):
         except Exception as e:
             self._show_system_msg(f"YOLO toggle failed: {e}")
         return True
+
+    def _cmd_rollback(self, args: str) -> bool:
+        """Handle /rollback — list, diff, or restore filesystem checkpoints.
+
+        Syntax:
+            /rollback                 — list checkpoints
+            /rollback <N>             — restore checkpoint N (also undoes last chat turn)
+            /rollback diff <N>        — preview changes since checkpoint N
+            /rollback <N> <file>      — restore a single file from checkpoint N
+        """
+        if not self._agent:
+            self._show_system_msg("No active agent session.")
+            return True
+
+        mgr = self._agent._checkpoint_mgr
+        if not mgr.enabled:
+            self._show_system_msg(
+                "Checkpoints are not enabled.  "
+                "Add to config.yaml: checkpoints: { enabled: true }"
+            )
+            return True
+
+        cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+        parts = args.split() if args else []
+
+        from tools.checkpoint_manager import format_checkpoint_list
+
+        if not parts:
+            # List checkpoints
+            checkpoints = mgr.list_checkpoints(cwd)
+            self._show_system_msg(format_checkpoint_list(checkpoints, cwd))
+            return True
+
+        # /rollback diff <N>
+        if parts[0].lower() == "diff":
+            if len(parts) < 2:
+                self._show_system_msg("Usage: /rollback diff <N>")
+                return True
+            checkpoints = mgr.list_checkpoints(cwd)
+            if not checkpoints:
+                self._show_system_msg(f"No checkpoints found for {cwd}")
+                return True
+            target_hash = self._resolve_checkpoint_ref(parts[1], checkpoints)
+            if not target_hash:
+                return True
+            result = mgr.diff(cwd, target_hash)
+            if result["success"]:
+                stat = result.get("stat", "")
+                diff = result.get("diff", "")
+                if not stat and not diff:
+                    self._show_system_msg("No changes since this checkpoint.")
+                else:
+                    lines = []
+                    if stat:
+                        lines.append(stat)
+                    if diff:
+                        diff_lines = diff.splitlines()
+                        if len(diff_lines) > 80:
+                            lines.extend(diff_lines[:80])
+                            lines.append(f"  ... ({len(diff_lines) - 80} more lines)")
+                        else:
+                            lines.append(diff)
+                    self._show_system_msg("\n".join(lines))
+            else:
+                self._show_system_msg(f"❌ {result['error']}")
+            return True
+
+        # /rollback <N> [file]
+        checkpoints = mgr.list_checkpoints(cwd)
+        if not checkpoints:
+            self._show_system_msg(f"No checkpoints found for {cwd}")
+            return True
+
+        target_hash = self._resolve_checkpoint_ref(parts[0], checkpoints)
+        if not target_hash:
+            return True
+
+        file_path = parts[1] if len(parts) > 1 else None
+        result = mgr.restore(cwd, target_hash, file_path=file_path)
+        if result["success"]:
+            if file_path:
+                msg = f"✅ Restored {file_path} from checkpoint {result['restored_to']}: {result['reason']}"
+            else:
+                msg = f"✅ Restored to checkpoint {result['restored_to']}: {result['reason']}"
+            msg += "\n  A pre-rollback snapshot was saved automatically."
+            self._show_system_msg(msg)
+
+            # Also undo the last conversation turn so agent context matches
+            # the restored filesystem state (same as CLI /rollback behavior).
+            if self._history:
+                self._cmd_undo()
+                self._show_system_msg("Chat turn undone to match restored file state.")
+        else:
+            self._show_system_msg(f"❌ {result['error']}")
+        return True
+
+    def _resolve_checkpoint_ref(self, ref: str, checkpoints: list) -> str | None:
+        """Resolve a checkpoint number or hash to a full commit hash."""
+        try:
+            idx = int(ref) - 1  # 1-indexed for user
+            if 0 <= idx < len(checkpoints):
+                return checkpoints[idx]["hash"]
+            else:
+                self._show_system_msg(f"Invalid checkpoint number. Use 1-{len(checkpoints)}.")
+                return None
+        except ValueError:
+            # Assume it's a hash prefix
+            matches = [c for c in checkpoints if c["hash"].startswith(ref) or c["short_hash"] == ref]
+            if len(matches) == 1:
+                return matches[0]["hash"]
+            elif len(matches) > 1:
+                self._show_system_msg(f"Ambiguous hash prefix — matches {len(matches)} checkpoints.")
+                return None
+            else:
+                self._show_system_msg(f"Checkpoint '{ref}' not found.")
+                return None
 
     # ── Agent turn ──
 
