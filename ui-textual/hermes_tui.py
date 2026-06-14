@@ -229,6 +229,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll, Container, Horizontal, Vertical, Center
 from textual.widgets import Static, TextArea, OptionList, Input
+from textual.widgets._option_list import Option
 from textual.screen import ModalScreen
 from textual.message import Message
 from textual import events
@@ -1145,8 +1146,9 @@ class SessionPickerScreen(ModalScreen[str | None]):
         Binding("q", "close", "Close", show=False),
     ]
 
-    def __init__(self, current_session_id: str = "", **kwargs):
+    def __init__(self, current_session_id: str = "", bg_sessions: dict | None = None, **kwargs):
         self._current_session_id = current_session_id
+        self._bg_sessions = bg_sessions or {}
         super().__init__(**kwargs)
 
     def compose(self) -> ComposeResult:
@@ -1161,19 +1163,29 @@ class SessionPickerScreen(ModalScreen[str | None]):
         try:
             from hermes_state import SessionDB
             db = SessionDB()
-            sessions = db.list_sessions(limit=30)
+            sessions = db.list_sessions_rich(limit=30, order_by_last_active=True)
         except Exception:
             sessions = []
 
         ol = self.query_one("#sp-list", OptionList)
         for s in sessions:
-            sid = s.get("session_id", "")
-            title = s.get("title", "") or sid[:12]
+            sid = s.get("id", "")
+            title = s.get("title", "") or s.get("preview", "") or sid[:12]
             msg_count = s.get("message_count", 0)
-            updated = s.get("updated_at", "")
+            updated = s.get("last_active", "") or s.get("started_at", "")
             if isinstance(updated, str):
                 updated = updated[:16].replace("T", " ")
             current = " ◀" if sid == self._current_session_id else ""
+            # Show 🔄 for background sessions that are still running
+            bg_info = self._bg_sessions.get(sid)
+            if bg_info:
+                bg_status = bg_info.get("status", "")
+                if bg_status == "running":
+                    current = " 🔄"
+                elif bg_status == "completed":
+                    current = " ✅"
+                elif bg_status == "error":
+                    current = " ❌"
             label = f"{title} ({msg_count} msgs, {updated}){current}"
             ol.add_option(Option(label, id=sid))
 
@@ -1371,6 +1383,7 @@ class SlashCompleter(Static):
         ("/reload-skills", "Rescan skills directory"),
         ("/yolo", "Toggle auto-approve all commands"),
         ("/rollback", "List or restore filesystem checkpoints"),
+        ("/sessions", "Browse and switch sessions"),
         ("/clear", "Clear chat and start new session"),
         ("/quit", "Exit"),
     ]
@@ -1635,15 +1648,14 @@ class PromptArea(TextArea):
 # ─── Sidebar ───
 
 class Sidebar(Vertical):
-    """Right-hand info panel: Context · Usage · MCP · LSP · footer."""
+    """Right-hand info panel: Context · Usage · Sessions · footer."""
 
     def compose(self) -> ComposeResult:
         yield Static("", id="sb-title")
         yield Static("", id="sb-context")
         yield Static("", id="sb-tasks")
         yield Static("", id="sb-usage")
-        yield Static("", id="sb-mcp")
-        yield Static("", id="sb-lsp")
+        yield Static("", id="sb-sessions")
         yield Static("", id="sb-footer")
 
     def _section(self, header: str, rows: list[tuple[str, str]]) -> Group:
@@ -1705,20 +1717,29 @@ class Sidebar(Vertical):
             rows = [("no tools used", C_DIM)]
         self.query_one("#sb-usage", Static).update(self._section("Usage", rows))
 
-    def set_mcp(self, servers: list[tuple[str, bool]]):
-        if servers:
-            rows = []
-            for name, ok in servers:
-                dot = "●" if ok else "○"
-                label = "Connected" if ok else "Disconnected"
-                style = C_GREEN if ok else C_DIM
-                rows.append((f"{dot} {name} {label}", style))
-        else:
-            rows = [("no MCP servers", C_DIM)]
-        self.query_one("#sb-mcp", Static).update(self._section("MCP", rows))
+    def set_sessions(self, sessions: list[dict]):
+        """Show background/running sessions in the sidebar.
 
-    def set_lsp(self, text: str = "LSPs are disabled"):
-        self.query_one("#sb-lsp", Static).update(self._section("LSP", [(text, C_DIM)]))
+        Each dict: {session_id, title, status, model}
+        status: "running" | "completed" | "error"
+        """
+        rows: list[tuple[str, str]] = []
+        for s in sessions:
+            status = s.get("status", "")
+            title = s.get("title", "") or s.get("session_id", "")[:12]
+            if len(title) > 24:
+                title = title[:22] + "…"
+            if status == "running":
+                rows.append((f"🔄 {title}", C_MAGENTA))
+            elif status == "completed":
+                rows.append((f"✅ {title}", C_GREEN))
+            elif status == "error":
+                rows.append((f"❌ {title}", C_RED))
+            else:
+                rows.append((f"● {title}", C_DIM))
+        if not rows:
+            rows = [("no background sessions", C_DIM)]
+        self.query_one("#sb-sessions", Static).update(self._section("Sessions", rows))
 
     def set_footer(self, cwd: str, version: str):
         g = Group(
@@ -1770,9 +1791,8 @@ class HermesApp(App):
     #sb-context { margin: 0 0 1 0; }
     #sb-tasks   { margin: 0 0 1 0; display: none; }
     #sb-tasks.has-content { display: block; }
-    #sb-usage   { margin: 0 0 1 0; }
-    #sb-mcp     { margin: 0 0 1 0; }
-    #sb-lsp     { margin: 0 0 1 0; }
+    #sb-usage     { margin: 0 0 1 0; }
+    #sb-sessions { margin: 0 0 1 0; }
     #sb-footer  { dock: bottom; }
 
     /* ── Messages ── */
@@ -2107,6 +2127,14 @@ class HermesApp(App):
         super().__init__(**kwargs)
         self._agent = None
         self._history: list = []
+        # ── Multi-session support ──
+        # _active_session_id: session_id of the currently displayed session
+        # _bg_sessions: {session_id: {agent, history, status, title}} for background sessions
+        # _agent remains the active (foreground) agent for compatibility.
+        self._active_session_id: str = ""
+        self._bg_sessions: dict[str, dict] = {}
+        self._pending_switch_session_id: str = ""
+        self._pending_new_session: bool = False
         # Per-turn state — simple flat model.
         # _stream_buf accumulates all text deltas for this turn.
         # _response_widget is the single Static that shows streamed/final text.
@@ -2127,6 +2155,7 @@ class HermesApp(App):
         self._anim_timer = None
         self._anim_phase: int = 0
         self._spinner_idx: int = 0
+        self._sidebar_timer = None  # periodic sidebar refresh for bg sessions
         self._cc_last_sid: str | None = None  # cache for _agent_compressions
         self._cc_last_db: int = 0
         self._tasks: list[dict] = []  # plan tasks from todo tool
@@ -2159,8 +2188,7 @@ class HermesApp(App):
         sb = self.query_one(Sidebar)
         sb.set_title("Hermes Agent")
         sb.set_context(0, None, 0.0)
-        sb.set_mcp([])
-        sb.set_lsp()
+        sb.set_sessions([])
         sb.set_footer(self._short_cwd(), self._hermes_version())
 
         msgs = self.query_one("#chat-area")
@@ -2261,6 +2289,36 @@ class HermesApp(App):
         self._version = self._hermes_version()
         self._wire_agent_callbacks()
         self._wire_blocking_callbacks()
+
+        # ── Handle pending session switch (from non-blocking demote+switch) ──
+        pending = self._pending_switch_session_id
+        if pending:
+            self._pending_switch_session_id = ""
+            self._active_session_id = pending
+            # Switch agent to the target session
+            if self._agent:
+                self._agent.session_id = pending
+                self._agent._tui_is_resume = True
+                self._agent._cached_system_prompt = None
+        elif self._pending_new_session:
+            # Ctrl+N while working — create a fresh session, don't resume old one
+            self._pending_new_session = False
+            if self._agent:
+                try:
+                    from hermes_state import SessionDB
+                    import uuid
+                    db = getattr(self._agent, "_session_db", None) or getattr(self._agent, "session_db", None) or SessionDB()
+                    new_id = f"textual-tui-{uuid.uuid4().hex[:8]}"
+                    db.create_session(new_id, source="textual-tui")
+                    self._agent.session_id = new_id
+                    self._agent._cached_system_prompt = None
+                    self._active_session_id = new_id
+                    self._show_system_msg(f"New session: {new_id}")
+                except Exception as e:
+                    self._show_system_msg(f"New session failed: {e}")
+        else:
+            self._active_session_id = getattr(self._agent, "session_id", "") or ""
+
         try:
             compressor = getattr(self._agent, "context_compressor", None)
             self._context_len = getattr(compressor, "context_length", None) if compressor else None
@@ -2275,6 +2333,10 @@ class HermesApp(App):
 
         self._refresh_sidebar()
         self._render_status()
+
+        # ── Start periodic sidebar refresh (keeps bg session status in sync) ──
+        if self._sidebar_timer is None:
+            self._sidebar_timer = self.set_interval(2.0, self._tick_sidebar)
 
     def _restore_session_state(self):
         """Restore session_total_tokens and compression_count from SessionDB
@@ -2785,6 +2847,8 @@ class HermesApp(App):
             return self._cmd_reload_mcp()
         elif canonical == "reload-skills":
             return self._cmd_reload_skills()
+        elif canonical == "sessions":
+            return self._cmd_sessions()
         elif canonical == "clear":
             self.action_clear_chat()
             return True
@@ -2820,6 +2884,7 @@ class HermesApp(App):
             "  /reload-skills     Rescan ~/.hermes/skills/",
             "  /yolo [off]        Toggle auto-approve all commands",
             "  /rollback [N|diff] List or restore filesystem checkpoints",
+            "  /sessions          Browse and switch sessions",
             "  /clear             Clear chat and start new session",
             "  /quit              Exit",
             "",
@@ -2840,6 +2905,11 @@ class HermesApp(App):
             Static(Group(*[Text(l, style=C_DIM) for l in lines]), classes="system-msg")
         )
         self._scroll_to_bottom()
+        return True
+
+    def _cmd_sessions(self) -> bool:
+        """Open the session picker — non-blocking switch."""
+        self._open_session_picker()
         return True
 
     def _cmd_model(self, args: str) -> bool:
@@ -3265,9 +3335,16 @@ class HermesApp(App):
             # UI thread) for approval/sudo prompts to find the callbacks.
             self._register_thread_local_callbacks()
 
+            # Snapshot the agent and session_id at turn start so that even if
+            # the user switches sessions mid-turn, this thread can still
+            # correctly route its completion callback.
+            agent = self._agent
+            turn_sid = getattr(agent, "session_id", "") if agent else ""
+            history_snapshot = list(self._history)
+
             # ── Plan mode: prepend plan-only instruction ──
             actual_text = text
-            if getattr(self._agent, "_tui_plan_mode", False):
+            if getattr(agent, "_tui_plan_mode", False) if agent else False:
                 actual_text = (
                     "[PLAN MODE — do NOT execute any code, edit any file, or run any "
                     "mutating command. Only analyze, plan, and describe what you would do. "
@@ -3281,21 +3358,23 @@ class HermesApp(App):
                 # would be processed twice.  We already set stream_delta_callback
                 # in _wire_agent_callbacks(), which is sufficient to enable the
                 # streaming path (_has_stream_consumers() checks it).
-                result = self._agent.run_conversation(
+                result = agent.run_conversation(
                     actual_text,
-                    conversation_history=list(self._history),
-                    task_id=getattr(self._agent, "session_id", None),
+                    conversation_history=history_snapshot,
+                    task_id=turn_sid,
                 )
                 final_text = ""
+                turn_messages = None
                 if isinstance(result, dict):
-                    if isinstance(result.get("messages"), list):
-                        self._history = result["messages"]
+                    messages = result.get("messages")
+                    if isinstance(messages, list):
+                        turn_messages = messages
                     final_text = result.get("final_response", "")
                     if result.get("error"):
                         final_text = result.get("final_response", str(result["error"]))
-                self.call_from_thread(self._on_turn_complete, final_text)
+                self.call_from_thread(self._on_turn_complete, final_text, turn_sid, turn_messages)
             except Exception as e:
-                self.call_from_thread(self._show_error, str(e))
+                self.call_from_thread(self._show_error, str(e), turn_sid)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -3526,7 +3605,42 @@ class HermesApp(App):
         )
         self._scroll_to_bottom()
 
-    def _on_turn_complete(self, text: str):
+    def _on_turn_complete(self, text: str, turn_sid: str = "", turn_messages: list | None = None):
+        # ── Check if this is a background session completing ──
+        # turn_sid comes from the _run_turn thread snapshot, so it correctly
+        # identifies the session even if the user switched away mid-turn.
+        if turn_sid and turn_sid in self._bg_sessions:
+            # Background session finished — update status, notify user
+            info = self._bg_sessions[turn_sid]
+            info["status"] = "completed"
+            info["finished_at"] = time.time()
+            if turn_messages is not None:
+                info["history"] = turn_messages
+            title = info.get("title", turn_sid[:12])
+            # Update sidebar to show ✅ instead of 🔄
+            self._refresh_sidebar()
+            # Show notification
+            self._show_notify(f"✅ Background session done: {title}")
+            return
+
+        # ── Foreground session completion ──
+        # Only process if this is the active session
+        if turn_sid and turn_sid != self._active_session_id:
+            # Stale completion from a session that was demoted after _run_turn
+            # captured the snapshot — safe to ignore, the bg_sessions dict
+            # already got the status update from _demote_to_background.
+            # But save the messages in bg_sessions if it's there.
+            if turn_sid in self._bg_sessions and turn_messages is not None:
+                self._bg_sessions[turn_sid]["history"] = turn_messages
+                self._bg_sessions[turn_sid]["status"] = "completed"
+                self._bg_sessions[turn_sid]["finished_at"] = time.time()
+                self._refresh_sidebar()
+            return
+
+        # Update history on the UI thread (thread-safe)
+        if turn_messages is not None:
+            self._history = turn_messages
+
         try:
             self._finalize_reasoning()
 
@@ -3620,7 +3734,17 @@ class HermesApp(App):
         self._scroll_to_bottom()
         self.query_one("#prompt-input").focus()
 
-    def _show_error(self, msg: str):
+    def _show_error(self, msg: str, turn_sid: str = ""):
+        # ── Check if this is a background session error ──
+        if turn_sid and turn_sid in self._bg_sessions:
+            info = self._bg_sessions[turn_sid]
+            info["status"] = "error"
+            info["finished_at"] = time.time()
+            title = info.get("title", turn_sid[:12])
+            self._refresh_sidebar()
+            self._show_notify(f"❌ Background session error: {title}")
+            return
+
         self._finalize_reasoning()
         if self._response_widget is not None:
             if self._stream_buf.strip():
@@ -3731,16 +3855,64 @@ class HermesApp(App):
             pass
         return []
 
+    def _tick_sidebar(self):
+        """Periodic sidebar refresh — keeps bg session status in sync."""
+        # Clean up completed/error sessions that have been shown for >30s
+        now = time.time()
+        stale = []
+        for sid, info in self._bg_sessions.items():
+            finished_at = info.get("finished_at", 0)
+            if finished_at and (now - finished_at) > 30:
+                stale.append(sid)
+        for sid in stale:
+            del self._bg_sessions[sid]
+
+        self._refresh_sidebar()
+
+    def _bg_sessions_list(self) -> list[dict]:
+        """Build list of active sessions for the sidebar.
+
+        Includes: current foreground session (if running) + all background sessions.
+        """
+        result = []
+        # Current foreground session
+        if self.is_working and self._active_session_id:
+            title = ""
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB()
+                meta = db.get_session(self._active_session_id)
+                if meta:
+                    title = meta.get("title", "") or meta.get("preview", "")
+            except Exception:
+                pass
+            if not title:
+                title = self._active_session_id[:12]
+            result.append({
+                "session_id": self._active_session_id,
+                "title": f"▸ {title}",  # ▸ marks foreground
+                "status": "running",
+            })
+        # Background sessions
+        for sid, info in self._bg_sessions.items():
+            result.append({
+                "session_id": sid,
+                "title": info.get("title", ""),
+                "status": info.get("status", "running"),
+            })
+        return result
+
     def _refresh_sidebar(self):
+        sb = self.query_one(Sidebar)
+        # Always update bg sessions (even when _agent is None after demote)
+        sb.set_sessions(self._bg_sessions_list())
+        sb.set_footer(self._short_cwd(), self._version or self._hermes_version())
         if self._agent is None:
             return
-        sb = self.query_one(Sidebar)
         tokens = self._agent_tokens()
         sb.set_context(tokens, None, 0.0, self._agent_compressions(), self._context_len)
         sb.set_tasks(self._tasks)
         sb.set_usage(self._turn_tools, self._turn_skills)
-        sb.set_mcp(self._agent_mcp())
-        sb.set_footer(self._short_cwd(), self._version or self._hermes_version())
 
     def _render_status(self, error: bool = False):
         bar = self.query_one("#status-bar", Static)
@@ -3870,18 +4042,31 @@ class HermesApp(App):
         self._render_status()
 
     def action_new_session(self):
-        """Ctrl+N — start a fresh session (clear + new session ID)."""
+        """Ctrl+N — start a fresh session (clear + new session ID).
+
+        Non-blocking: if the current session is running, it continues in
+        the background.
+        """
+        # If working, demote current session to background
         if self.is_working:
-            self._show_system_msg("Cannot start new session while agent is working.")
-            return
+            old_sid = self._active_session_id
+            if old_sid:
+                self._demote_to_background(old_sid)
+                # _demote_to_background builds a new agent async.
+                # Mark that we want a fresh session (not resume the old one).
+                self._pending_new_session = True
+                return
         self.action_clear_chat()
         if self._agent:
             try:
                 from hermes_state import SessionDB
+                import uuid
                 session_db = getattr(self._agent, "_session_db", None) or getattr(self._agent, "session_db", None) or SessionDB()
-                new_id = session_db.create_session(source="textual-tui")
+                new_id = f"textual-tui-{uuid.uuid4().hex[:8]}"
+                session_db.create_session(new_id, source="textual-tui")
                 self._agent.session_id = new_id
                 self._agent._cached_system_prompt = None
+                self._active_session_id = new_id
                 self._show_system_msg(f"New session: {new_id}")
             except Exception as e:
                 self._show_system_msg(f"New session failed: {e}")
@@ -3979,34 +4164,198 @@ class HermesApp(App):
         self._open_session_picker()
 
     def _open_session_picker(self):
-        """Show a modal with recent sessions; on selection, resume that session."""
-        if self.is_working:
-            self._show_system_msg("Cannot switch sessions while agent is working.")
-            return
-        current_id = getattr(self._agent, "session_id", "") or ""
+        """Show a modal with recent sessions; on selection, resume that session.
+
+        Non-blocking: if the current session is running, it continues in the
+        background (callbacks detached from UI). The new session becomes the
+        foreground.
+        """
+        current_id = self._active_session_id
 
         def on_pick(session_id: str | None):
             if not session_id or session_id == current_id:
                 return
-            self._resume_session(session_id)
+            self._switch_to_session(session_id)
 
-        self.push_screen(SessionPickerScreen(current_id), on_pick)
+        self.push_screen(SessionPickerScreen(current_id, self._bg_sessions), on_pick)
 
-    def _resume_session(self, session_id: str):
-        """Resume a different session by ID — clear chat and reload."""
-        if not self._agent:
+    def _switch_to_session(self, session_id: str):
+        """Switch to a different session. If the current session is running,
+        it continues in the background (detached from UI callbacks).
+        """
+        old_sid = self._active_session_id
+        was_working = self.is_working
+
+        # ── Demote current session to background if it's running ──
+        if was_working and old_sid and old_sid != session_id:
+            self._demote_to_background(old_sid)
+
+        # ── Check if the target session is a background session we can promote ──
+        if session_id in self._bg_sessions:
+            self._promote_from_background(session_id)
             return
+
+        # ── Load a new/different session from DB ──
+        # If _demote_to_background was called, _agent is None and a new one
+        # is building async. Set the target session_id so _on_agent_ready
+        # picks it up.
+        if self._agent is None:
+            # Agent is building in background — stash target session for later
+            self._pending_switch_session_id = session_id
+            self._show_system_msg(f"Loading session…")
+            return
+
         try:
             self.action_clear_chat()
             self._agent.session_id = session_id
             self._agent._tui_is_resume = True
             self._agent._cached_system_prompt = None
+            self._active_session_id = session_id
             self._load_resumed_session()
             self._restore_session_state()
             self._refresh_sidebar()
             self._render_status()
         except Exception as e:
             self._show_system_msg(f"Failed to resume session: {e}")
+
+    def _demote_to_background(self, session_id: str):
+        """Move the current running session to the background.
+
+        Detach UI callbacks so the agent keeps running but doesn't push
+        updates to the chat area. Messages still get written to SessionDB.
+        """
+        agent = self._agent
+        if agent is None:
+            return
+
+        # Get session title for sidebar display
+        title = ""
+        try:
+            from hermes_state import SessionDB
+            db = getattr(agent, "_session_db", None) or getattr(agent, "session_db", None) or SessionDB()
+            meta = db.get_session(session_id)
+            if meta:
+                title = meta.get("title", "") or meta.get("preview", "")
+        except Exception:
+            pass
+        if not title:
+            title = session_id[:12]
+
+        # Detach UI callbacks — agent keeps running, messages go to DB only
+        agent.stream_delta_callback = None
+        agent.reasoning_callback = None
+        agent.thinking_callback = None
+        agent.tool_start_callback = None
+        agent.tool_complete_callback = None
+        agent.tool_progress_callback = None
+        agent.status_callback = None
+        # Keep clarify_callback so the agent can still ask questions (will block
+        # the bg thread, acceptable for now).
+
+        # Store in background sessions dict
+        self._bg_sessions[session_id] = {
+            "agent": agent,
+            "history": list(self._history),
+            "status": "running",
+            "title": title,
+        }
+
+        # Mark UI as not working (the bg session is no longer "our" work)
+        self.is_working = False
+        self._stream_buf = ""
+        self._response_widget = None
+        self._active_reasoning = None
+        self._reasoning_summary = None
+        self._tool_blocks.clear()
+        self._tool_summary = None
+        self._status_kind = ""
+        self._status_text = None
+
+        # Build a fresh agent for the new foreground session
+        self._agent = None
+        self._history = []
+        self._build_agent_bg()
+
+        self._refresh_sidebar()
+        self._render_status()
+        self._show_system_msg(f"🔄 Session {title} running in background")
+
+    def _promote_from_background(self, session_id: str):
+        """Promote a background session back to the foreground.
+
+        If the current foreground session is running, it gets demoted to
+        background first.
+        """
+        # Demote current foreground session if it's running
+        if self.is_working and self._active_session_id and self._active_session_id != session_id:
+            # Avoid infinite recursion: the demote creates a new agent, but we
+            # don't want _switch_to_session logic — just stash the current agent.
+            old_agent = self._agent
+            old_sid = self._active_session_id
+            if old_agent and old_sid and old_sid not in self._bg_sessions:
+                title = ""
+                try:
+                    from hermes_state import SessionDB
+                    db = getattr(old_agent, "_session_db", None) or getattr(old_agent, "session_db", None) or SessionDB()
+                    meta = db.get_session(old_sid)
+                    if meta:
+                        title = meta.get("title", "") or meta.get("preview", "")
+                except Exception:
+                    pass
+                if not title:
+                    title = old_sid[:12]
+                # Detach callbacks
+                old_agent.stream_delta_callback = None
+                old_agent.reasoning_callback = None
+                old_agent.thinking_callback = None
+                old_agent.tool_start_callback = None
+                old_agent.tool_complete_callback = None
+                old_agent.tool_progress_callback = None
+                old_agent.status_callback = None
+                self._bg_sessions[old_sid] = {
+                    "agent": old_agent,
+                    "history": list(self._history),
+                    "status": "running",
+                    "title": title,
+                }
+                self.is_working = False
+
+        info = self._bg_sessions.pop(session_id, None)
+        if not info:
+            return
+
+        agent = info["agent"]
+        status = info.get("status", "")
+
+        self.action_clear_chat()
+        self._agent = agent
+        self._active_session_id = session_id
+        self._history = info.get("history", [])
+
+        if status == "running":
+            # Re-wire callbacks to push to UI again
+            self._wire_agent_callbacks()
+            self.is_working = True
+            # Reset streaming state for the promoted session
+            self._stream_buf = ""
+            self._response_widget = None
+            self._active_reasoning = None
+            self._reasoning_summary = None
+            self._tool_blocks.clear()
+            self._tool_summary = None
+            self._status_kind = ""
+            self._status_text = None
+            self._show_system_msg(f"🔄 Switched back to running session {info.get('title', session_id[:12])}")
+        else:
+            # Completed session — load full history from DB
+            self._agent._tui_is_resume = True
+            self._agent._cached_system_prompt = None
+            self._load_resumed_session()
+            self._restore_session_state()
+            self._show_system_msg(f"✅ Session {info.get('title', session_id[:12])} completed")
+
+        self._refresh_sidebar()
+        self._render_status()
 
     def on_resize(self, event) -> None:
         self._render_status(error=False)
