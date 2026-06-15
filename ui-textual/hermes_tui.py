@@ -2102,13 +2102,8 @@ class HermesApp(App):
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "clear_chat", "Clear"),
         Binding("ctrl+n", "new_session", "New session"),
-        Binding("ctrl+o", "open_sessions", "Sessions"),
-        Binding("ctrl+m", "pick_model", "Model"),
         Binding("ctrl+p", "pick_provider", "Provider"),
         Binding("ctrl+k", "clear_input", "Clear input"),
-        Binding("ctrl+r", "retry_last", "Retry"),
-        Binding("ctrl+z", "undo_last", "Undo"),
-        Binding("ctrl+e", "compress_context", "Compress"),
         Binding("shift+tab", "cycle_permission", "Mode"),
         Binding("escape", "interrupt", "Interrupt", show=False),
     ]
@@ -2197,8 +2192,7 @@ class HermesApp(App):
                 "**Welcome to Hermes Agent**\n\n"
                 "Send a message to start chatting.\n\n"
                 "`Enter` Smart(Send/Newline)  ·  `Ctrl+Enter` Force Send  ·  `↑↓` History  ·  `Tab` Complete  ·  `Ctrl+L` Clear\n"
-                "`Ctrl+N` New  ·  `Ctrl+O` Sessions  ·  `Ctrl+M` Model  ·  `Ctrl+P` Provider  ·  `Shift+Tab` Mode\n"
-                "`Ctrl+R` Retry  ·  `Ctrl+Z` Undo  ·  `Ctrl+E` Compress  ·  `Ctrl+Q` Quit"
+                "`Ctrl+N` New  ·  `Shift+Tab` Mode · `Ctrl+Q` Quit"
             ),
             classes="welcome",
         ))
@@ -2893,12 +2887,6 @@ class HermesApp(App):
             "  Ctrl+P             Switch provider",
             "  Shift+Tab          Cycle mode (Default→Plan→Auto)",
             "  Ctrl+N             New session",
-            "  Ctrl+O             Browse recent sessions",
-            "  Ctrl+R             Retry last message",
-            "  Ctrl+Z             Undo last exchange",
-            "  Ctrl+E             Compress context",
-            "  Ctrl+K             Clear input",
-            "  Ctrl+L             Clear chat",
             "  Ctrl+Q             Quit",
         ]
         self.query_one("#chat-area").mount(
