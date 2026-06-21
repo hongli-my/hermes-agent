@@ -985,6 +985,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         provider: Optional[str] = None,
+        working_dir: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1038,6 +1039,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            working_dir=working_dir,
         )
         return agent
 
@@ -1717,6 +1719,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
+        # Per-request working directory (passed to AIAgent)
+        working_dir = body.get("working_dir") or body.get("workdir") or None
+
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -1898,6 +1903,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 provider=requested_provider,
+                working_dir=working_dir,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1918,6 +1924,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 provider=requested_provider,
+                working_dir=working_dir,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3667,6 +3674,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         provider: Optional[str] = None,
+        working_dir: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3691,6 +3699,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=tool_complete_callback,
                 gateway_session_key=gateway_session_key,
                 provider=provider,
+                working_dir=working_dir,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
