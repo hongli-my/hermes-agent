@@ -549,6 +549,22 @@ def _rpc_server_loop(
                     for param in _TERMINAL_BLOCKED_PARAMS:
                         tool_args.pop(param, None)
 
+                # Re-assert the owning agent's working_dir before dispatch.
+                # This RPC loop runs on a worker thread whose ContextVar
+                # snapshot was taken at execute_code entry (via
+                # propagate_context_to_thread).  If the agent's working_dir
+                # changed since then, tools that read the ContextVar
+                # (terminal / code_execution) or the legacy env var
+                # (file tools) would see a stale value.  Re-syncing here
+                # keeps every dispatched tool anchored to the right worktree.
+                try:
+                    from agent.workdir_ctx import get_terminal_cwd
+                    _rpc_cwd = get_terminal_cwd()
+                    if _rpc_cwd:
+                        os.environ["TERMINAL_CWD"] = _rpc_cwd
+                except Exception:
+                    pass
+
                 # Dispatch through the standard tool handler.
                 # Suppress stdout/stderr from internal tool handlers so
                 # their status prints don't leak into the CLI spinner.

@@ -114,13 +114,32 @@ def _sentinel_free_abs_cwd(raw: str | None) -> str | None:
 
 
 def _configured_terminal_cwd() -> str | None:
-    """Return ``$TERMINAL_CWD`` only when it names a real directory anchor.
+    """Return the configured terminal cwd only when it names a real directory.
 
     Sentinel values (see ``_TERMINAL_CWD_SENTINELS``) and relative paths are
     rejected — a relative anchor is meaningless without knowing which cwd it is
     relative to, which is exactly the ambiguity that misroutes worktree edits.
     Only an absolute, sentinel-free value is honored.
+
+    Resolution order (mirrors ``terminal_tool`` / ``code_execution_tool``):
+
+      1. The per-agent ContextVar (``agent.workdir_ctx.get_terminal_cwd``).
+         This is the source of truth for concurrent agents inside one process
+         (workflow ``iteration``/``parallel``), where each AIAgent owns its own
+         workdir.  Without it, file tools would fall back to the process-global
+         ``os.environ["TERMINAL_CWD"]``, which is racy between threads — one
+         agent's ``write_file`` could land in another agent's worktree.
+      2. ``$TERMINAL_CWD`` (CLI / external integrations that set it directly).
     """
+    try:
+        from agent.workdir_ctx import get_terminal_cwd
+        ctx_cwd = get_terminal_cwd()
+        if ctx_cwd:
+            resolved = _sentinel_free_abs_cwd(ctx_cwd)
+            if resolved:
+                return resolved
+    except Exception:
+        pass
     return _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
 
 
